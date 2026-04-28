@@ -1,0 +1,13 @@
+# Dance Analysis — Python dependencies
+# Install with: pip install -r requirements.txt
+#
+# Also requires ffmpeg on PATH for audio extraction:
+#   Windows: winget install Gyan.FFmpeg  OR  choco install ffmpeg
+
+ultralytics>=8.0.0        # YOLOv8-pose multi-person tracking
+opencv-python>=4.8.0      # video I/O
+numpy>=1.24.0
+scipy>=1.11.0             # signal processing (Savitzky-Golay, FFT, peaks)
+librosa>=0.10.0           # beat detection
+soundfile>=0.12.0         # audio backend for librosa
+imageio-ffmpeg>=0.4.9     # bundled ffmpeg binary (no system install needed)
