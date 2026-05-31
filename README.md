@@ -1,14 +1,54 @@
 # WCS Video Analysis
 
-A pipeline for analyzing West Coast Swing dance videos and comparing your dancing to pro references. Built with YOLOv8 pose estimation, OpenCV, and a custom set of WCS-specific metrics covering leg action, body action, weight transfer / countering, and musicality.
+A self-contained Python pipeline for analysing West Coast Swing dance videos.
+Drop in your own practice clips and pro references — no configuration needed beyond
+pointing it at your files.
 
-**Status:** In progress — vibe-coded, personal-use grade. Reports generate cleanly; gap comparisons are descriptive but not yet calibrated against any formal scoring rubric.
+## What it measures
 
-## What it does
+The pipeline extracts multi-person poses with YOLOv8 (COCO-17 keypoints; no foot
+keypoint) and computes four metric categories:
 
-1. Extracts per-frame multi-person pose data from a video (YOLOv8-pose).
-2. Computes WCS-specific dance metrics from the pose timeseries.
-3. Generates a structured text report and (optionally) a gap-comparison table against one or more pro reference videos.
+**1. Leg action**
+Rise & fall (typical and dynamic), one-foot balance percentage, step counts broken
+down by traveling-articulated vs weight-only, and a full **articulation-quality**
+sub-block (see below).
+
+**2. Body action**
+Centre-of-mass motion and motion smoothness.
+
+**3. Weight / countering**
+Partner distance variance, post count, and counter-balance events.
+
+**4. Musicality (song-aware)**
+The pipeline analyses the audio to characterise the song itself (bounciness,
+dynamic range, accent locations throughout the track) and then asks whether the
+movement matches it:
+- **Texture match** — time-resolved correlation: does the dancer get bouncier in
+  punchy passages and smoother in legato ones?
+- **Bounce match** — beat-rhythm alignment.
+- **On-beat articulated steps %**, timing consistency, syncopation %.
+- **Accent response** — expression detected at musical accents found throughout the
+  song via any channel (feet, chest/body, free hands, head). Partnership coverage
+  credits an accent that *either* partner expresses.
+
+### Articulation-quality detail
+
+The LEG ACTION block includes an ARTICULATION QUALITY sub-block that distinguishes
+the **free/moving leg** from the **standing/weighted leg** (they do different jobs):
+
+- **Free-leg prep flexion** (knee/hip degrees) — how much the moving leg bends
+  while its foot is free to gather the step.
+- **Standing-leg knee flexion** — how much the weighted leg sinks/loads; this is
+  what actually lowers the body.
+- **Free knee↔hip coordination**, bend smoothness, straighten recovery, and
+  prep→arrival sequencing.
+
+Every report also includes a per-dancer **MOVEMENT-QUALITY & MUSICALITY DETAIL**
+section with bend-depth distributions (median/p75/p90/max), accent-vs-anchor
+comparisons, and amplitude-regulation correlations.
+
+---
 
 ## Setup
 
@@ -16,34 +56,89 @@ A pipeline for analyzing West Coast Swing dance videos and comparing your dancin
 pip install -r requirements.txt
 ```
 
-You also need ffmpeg on PATH for audio extraction:
+YOLOv8 pose weights (`yolov8n-pose.pt`) are downloaded automatically on first run.
 
-- Windows: `winget install Gyan.FFmpeg`
-- macOS: `brew install ffmpeg`
-- Linux: `apt install ffmpeg` (or distro equivalent)
+---
 
-The pose model (`yolov8n-pose.pt`) is committed to the repo so first-run is offline.
+## Adding your own pro references
 
-## Add your own videos
+Create `pro_refs.json` in the project root (copy `pro_refs.example.json` as a
+starting point):
 
-This repo intentionally ships without any video data. Drop your own files in the project root:
-
-- **Your dance video** (the one being analyzed) — anywhere, just pass its path to the analyzer.
-- **Pro reference videos** — any number, named `pro_reference*.mp4`. The comparison logic globs against this pattern. Pulling from YouTube with `yt-dlp` works fine.
-
-## Run an analysis
-
-```bash
-python pose_extraction.py path/to/your_video.mp4   # writes <name>.poses.json
-python dance_review.py path/to/your_video.mp4      # writes <name>_report.txt
+```json
+[
+  {
+    "video":   "pros/couple_a/clip.mp4",
+    "poses":   "pros/couple_a/clip_poses.json",
+    "label":   "Pro A (86 BPM)",
+    "lead_id": 2
+  }
+]
 ```
 
-Or use the included Claude Code skill at `wcs-analyze-skill/`.
+`lead_id` is which tracked Dancer ID (1 or 2) is the pro **lead** in that clip.
+Dancer IDs are re-assigned on every extraction, so identify the lead from a clear
+open-position frame and verify after each re-extraction.
 
-## File map
+If `pro_refs.json` is absent, the script auto-discovers `pros/*/` subfolders
+(first video + its matching `*_poses.json` per folder) and defaults `lead_id` to 1
+with a printed reminder to verify.
 
-- `pose_extraction.py` — `extract_poses(video_path)` returns a pose-timeseries dict.
-- `dance_metrics.py` — `compute_all_metrics(pose_data)` returns the metric dict.
-- `dance_review.py` — orchestrates the full pipeline and writes the report.
-- `wcs-analyze-skill/` — Claude Code skill packaging.
-- `yolov8n-pose.pt` — pre-trained pose-detection model.
+---
+
+## Running an analysis
+
+```bash
+# Basic analysis of a local video
+python wcs-analyze-skill/scripts/analyze.py path/to/your_video.mp4 --me left
+
+# With pro comparison
+python wcs-analyze-skill/scripts/analyze.py path/to/your_video.mp4 --compare-pros --me left
+
+# YouTube URL (downloads automatically)
+python wcs-analyze-skill/scripts/analyze.py "https://www.youtube.com/watch?v=..." --compare-pros
+
+# Also analyse the follower's metrics
+python wcs-analyze-skill/scripts/analyze.py path/to/your_video.mp4 --compare-pros --partner
+```
+
+**Key flags:**
+- `--me left|right` — which side you (the lead) start on; resolved to a Dancer ID
+  from the first clean frame. Default: `left`.
+- `--me-id 1|2` — override auto-detection and name your Dancer ID directly (use
+  when entry-heavy clips fool the side resolver).
+- `--compare-pros` — print gap analysis vs your pro references.
+- `--partner` — also show the follower's comparison in the gap analysis.
+- `--output-dir <dir>` — where to save reports (default: same directory as the video).
+
+Pose extraction is slow (~3–5 min for a 3-min video). Results are cached as
+`<stem>_poses.json` next to the video; subsequent runs are instant.
+
+---
+
+## Output files
+
+All outputs are saved next to the input video:
+
+| File | Contents |
+|---|---|
+| `<stem>_report.txt` | Full structured report |
+| `<stem>_gap_analysis.txt` | Pro comparison table (with `--compare-pros`) |
+| `<stem>_practice_notes.txt` | Note-bridged practice recommendations (written by the Claude skill) |
+
+---
+
+## Obsidian notes bridging (optional)
+
+When used via the bundled Claude skill (`wcs-analyze-skill/`), the pipeline can
+bridge each gap to your own prior WCS lesson notes in Obsidian via the Obsidian MCP
+connector. This is entirely optional — the pipeline works standalone without it.
+
+---
+
+## Pose model
+
+YOLOv8-pose, COCO-17 keypoints. There is **no foot keypoint** in COCO-17; ankle
+lift is estimated as a proxy from the moving-foot's vertical excursion. Joint angles
+are 2-D side-on estimates — good for relative you-vs-pro comparisons, not absolute
+biomechanical measurements.

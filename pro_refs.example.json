@@ -1,0 +1,14 @@
+[
+  {
+    "video":   "pros/couple_a/pro_reference.mp4",
+    "poses":   "pros/couple_a/pro_reference_poses.json",
+    "label":   "Pro A (86 BPM)",
+    "lead_id": 2
+  },
+  {
+    "video":   "pros/couple_b/pro_reference.mp4",
+    "poses":   "pros/couple_b/pro_reference_poses.json",
+    "label":   "Pro B (103 BPM)",
+    "lead_id": 1
+  }
+]
