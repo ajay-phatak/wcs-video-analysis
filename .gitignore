@@ -1,33 +1,39 @@
-# Videos
+# Video, audio, and large data files — never commit these
 *.mp4
-*.MOV
 *.mov
-*.avi
-*.m4a
-
-# yt-dlp intermediate format files (e.g. pro_reference2.f140.m4a)
-*.f[0-9]*.mp4
-*.f[0-9]*.m4a
-
-# Pose extraction outputs
-*.poses.json
+*.MOV
+*.wav
 *_poses.json
-
-# Generated reports / analysis
-*_report*.txt
+*_report.txt
 *_gap_analysis.txt
-report.txt
-amateur_report*.txt
+*_practice_notes.txt
 
-# Python
+# Personal video folders
+me/
+pros/
+
+# Personal pro-reference config (keep only pro_refs.example.json in the repo)
+pro_refs.json
+
+# Model weights
+yolov8*.pt
+
+# Python bytecode
 __pycache__/
 *.pyc
 *.pyo
-.venv/
-venv/
 
-# IDE / OS / Claude Code config
-.DS_Store
-.idea/
-.vscode/
+# Claude / local tool config
 .claude/
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
+
+# Keep the wcs-analyze-skill source tree
+!wcs-analyze-skill/
+
+# Local push artifacts / backups — never commit
+.git_payload.json
+push_to_github.ps1
+.git_corrupt_bak/

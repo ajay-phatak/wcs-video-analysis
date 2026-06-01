@@ -45,10 +45,49 @@ KP = {
 CONF_THRESHOLD = 0.3
 MAX_DANCERS = 2
 
+# Appearance re-ID parameters — keep each dancer's ID locked to the same person
+# through slot crossings, where nearest-neighbour position alone is ambiguous.
+APP_WEIGHT = 2.0          # weight of colour distance vs body-height-normalised spatial distance
+HIST_BINS  = [8, 4, 8]    # hue × saturation × VALUE bins for the torso histogram.
+                          # Value (brightness) is essential: the discriminating feature
+                          # for low-saturation outfits (black top vs white/grey shirt) is
+                          # brightness, which hue–saturation alone cannot separate.
+
 
 def _hip_center(kps: np.ndarray) -> np.ndarray:
     lh, rh = kps[KP["left_hip"]], kps[KP["right_hip"]]
     return np.array([(lh[0] + rh[0]) / 2, (lh[1] + rh[1]) / 2])
+
+
+def _torso_sig(img: np.ndarray, kps: np.ndarray):
+    """Hue-saturation histogram of the torso region — a clothing-colour signature
+    used to keep dancer identities stable through crossings. Returns None when the
+    torso keypoints are too sparse/small to sample reliably."""
+    pts = [kps[KP[n]][:2] for n in ("left_shoulder", "right_shoulder", "left_hip", "right_hip")
+           if kps[KP[n]][2] >= CONF_THRESHOLD]
+    if len(pts) < 3:
+        return None
+    pts = np.array(pts)
+    h, w = img.shape[:2]
+    x0, y0 = pts[:, 0].min(), pts[:, 1].min()
+    x1, y1 = pts[:, 0].max(), pts[:, 1].max()
+    px, py = (x1 - x0) * 0.1, (y1 - y0) * 0.1
+    x0, y0 = int(max(0, x0 - px)), int(max(0, y0 - py))
+    x1, y1 = int(min(w, x1 + px)), int(min(h, y1 + py))
+    if x1 - x0 < 4 or y1 - y0 < 4:
+        return None
+    hsv  = cv2.cvtColor(img[y0:y1, x0:x1], cv2.COLOR_BGR2HSV)
+    hist = cv2.calcHist([hsv], [0, 1, 2], None, HIST_BINS, [0, 180, 0, 256, 0, 256])
+    cv2.normalize(hist, hist, 0, 1, cv2.NORM_MINMAX)
+    return hist
+
+
+def _app_dist(a, b) -> float:
+    """Bhattacharyya distance in [0,1] between two colour signatures; 0 = identical.
+    Returns 0 when either signature is missing so appearance simply doesn't vote."""
+    if a is None or b is None:
+        return 0.0
+    return float(cv2.compareHist(a, b, cv2.HISTCMP_BHATTACHARYYA))
 
 
 def extract_poses(video_path: str, conf: float = CONF_THRESHOLD, frame_skip: int = 1,
@@ -90,72 +129,118 @@ def extract_poses(video_path: str, conf: float = CONF_THRESHOLD, frame_skip: int
         if result.keypoints is not None and result.boxes is not None:
             kps_all = result.keypoints.data.cpu().numpy()
             scores  = result.boxes.conf.cpu().numpy()
+            img     = result.orig_img        # original BGR frame for colour sampling
             # Sort detections by confidence descending so we pick the
             # two most confident when more than 2 people are detected
             order = np.argsort(scores)[::-1]
             for i in order[:MAX_DANCERS]:
                 kps = kps_all[i]
-                dets.append({"kps": kps, "center": _hip_center(kps)})
+                dets.append({"kps": kps, "center": _hip_center(kps),
+                             "sig": _torso_sig(img, kps)})
         raw_frames.append({"frame_idx": frame_idx,
                             "time_sec":  frame_idx / fps,
                             "dets":      dets})
 
-    # --- Pass 2: per-frame 2-person assignment --------------------------
-    # State: last known centre for each dancer ID (None = not yet seen)
+    # --- Pass 2: identity assignment with FROZEN appearance anchors ------
+    # The two dancers are separated up-front into two fixed colour anchors built
+    # from all "clean" frames (both dancers near full size), then every frame is
+    # assigned against those frozen anchors plus spatial continuity. Freezing the
+    # anchors — rather than updating a per-frame EMA reference — is what makes this
+    # robust: a single bad frame (a reflection at the walk-on, or one swap during an
+    # occlusion) can't poison the reference and lock the identities swapped.
+    frames_out = []
+
+    def _scale(dets):
+        hs = [body_height(d["kps"]) for d in dets if body_height(d["kps"]) > 10]
+        return float(np.mean(hs)) if hs else 100.0
+
+    def _avg_sig(sigs):
+        if not sigs:
+            return None
+        m = np.mean(np.stack(sigs), axis=0).astype(np.float32)
+        cv2.normalize(m, m, 0, 1, cv2.NORM_MINMAX)
+        return m
+
+    # Clean two-person frames: both detections near full size + both have a signature
+    all_bh = [body_height(d["kps"]) for rec in raw_frames for d in rec["dets"]]
+    med_bh = float(np.median(all_bh)) if all_bh else 0.0
+    clean = [rec["dets"] for rec in raw_frames
+             if len(rec["dets"]) == 2 and med_bh > 0
+             and body_height(rec["dets"][0]["kps"]) >= 0.6 * med_bh
+             and body_height(rec["dets"][1]["kps"]) >= 0.6 * med_bh
+             and rec["dets"][0]["sig"] is not None
+             and rec["dets"][1]["sig"] is not None]
+
+    # Build two anchors by constrained 2-clustering of the clean-frame pairs: the two
+    # detections in any frame are different people, so each pair is split across the two
+    # clusters. Seeded by the most-different-looking pair, then refined a few passes.
+    anchor = {1: None, 2: None}
+    if len(clean) >= 3:
+        pairs = [(d[0]["sig"], d[1]["sig"], float(d[0]["center"][0]), float(d[1]["center"][0]))
+                 for d in clean]
+        seed = max(pairs, key=lambda p: _app_dist(p[0], p[1]))
+        a_sig = seed[0] if seed[2] <= seed[3] else seed[1]      # left det of seed → cluster A
+        b_sig = seed[1] if seed[2] <= seed[3] else seed[0]
+        for _ in range(3):
+            a_acc, b_acc = [], []
+            for s0, s1, _x0, _x1 in pairs:
+                if _app_dist(s0, a_sig) + _app_dist(s1, b_sig) <= \
+                   _app_dist(s0, b_sig) + _app_dist(s1, a_sig):
+                    a_acc.append(s0); b_acc.append(s1)
+                else:
+                    a_acc.append(s1); b_acc.append(s0)
+            a_sig, b_sig = _avg_sig(a_acc), _avg_sig(b_acc)
+        # Map clusters A/B → Dancer 1/2 by which identity is on the LEFT at the
+        # first clean frame (keeps the "left = Dancer 1" convention).
+        s0, s1, x0, x1 = pairs[0]
+        det0_is_a = (_app_dist(s0, a_sig) + _app_dist(s1, b_sig)
+                     <= _app_dist(s0, b_sig) + _app_dist(s1, a_sig))
+        left_is_a = det0_is_a if x0 <= x1 else (not det0_is_a)
+        anchor[1], anchor[2] = (a_sig, b_sig) if left_is_a else (b_sig, a_sig)
+
+    use_app = anchor[1] is not None and anchor[2] is not None
+
     last_center = {1: None, 2: None}
-    frames_out  = []
+
+    def _cost(det, did, scale):
+        spatial = (np.linalg.norm(det["center"] - last_center[did]) / scale
+                   if last_center[did] is not None else 0.0)
+        appear  = APP_WEIGHT * _app_dist(det["sig"], anchor[did]) if use_app else 0.0
+        return spatial + appear
 
     for rec in raw_frames:
         dets = rec["dets"]
         dancers: dict[int, np.ndarray] = {}
+        scale = _scale(dets)
 
         if len(dets) == 0:
             pass  # both missing this frame
 
         elif len(dets) == 1:
-            # Assign to whichever dancer is closer (or dancer 1 if neither seen yet)
-            c = dets[0]["center"]
-            if last_center[1] is None and last_center[2] is None:
-                did = 1
-            elif last_center[1] is None:
-                did = 2
-            elif last_center[2] is None:
+            det = dets[0]
+            if last_center[1] is None and last_center[2] is None and not use_app:
                 did = 1
             else:
-                d1 = np.linalg.norm(c - last_center[1])
-                d2 = np.linalg.norm(c - last_center[2])
-                did = 1 if d1 <= d2 else 2
-            dancers[did] = dets[0]["kps"]
-            last_center[did] = dets[0]["center"]
+                did = 1 if _cost(det, 1, scale) <= _cost(det, 2, scale) else 2
+            dancers[did]     = det["kps"]
+            last_center[did] = det["center"]
 
         else:  # 2 detections
-            c0, c1 = dets[0]["center"], dets[1]["center"]
-
-            if last_center[1] is None and last_center[2] is None:
-                # First 2-person frame: label by horizontal position
-                if c0[0] <= c1[0]:
-                    dancers[1], dancers[2] = dets[0]["kps"], dets[1]["kps"]
-                    last_center[1], last_center[2] = c0, c1
-                else:
-                    dancers[1], dancers[2] = dets[1]["kps"], dets[0]["kps"]
-                    last_center[1], last_center[2] = c1, c0
+            d0, d1 = dets[0], dets[1]
+            if (last_center[1] is None and last_center[2] is None) and not use_app:
+                # No anchors and nothing seen yet: label by horizontal position
+                lo, hi = (d0, d1) if d0["center"][0] <= d1["center"][0] else (d1, d0)
+                dancers[1], dancers[2]         = lo["kps"], hi["kps"]
+                last_center[1], last_center[2] = lo["center"], hi["center"]
             else:
-                # Use whichever centres we have; fall back to spatial order if one missing
-                ref1 = last_center[1] if last_center[1] is not None else last_center[2]
-                ref2 = last_center[2] if last_center[2] is not None else last_center[1]
-
-                # 2×2 cost matrix, solve greedily (optimal for 2×2)
-                d00 = np.linalg.norm(c0 - ref1)
-                d01 = np.linalg.norm(c0 - ref2)
-                d10 = np.linalg.norm(c1 - ref1)
-                d11 = np.linalg.norm(c1 - ref2)
-
-                if d00 + d11 <= d01 + d10:
-                    dancers[1], dancers[2] = dets[0]["kps"], dets[1]["kps"]
-                    last_center[1], last_center[2] = c0, c1
+                cost_a = _cost(d0, 1, scale) + _cost(d1, 2, scale)   # d0→1, d1→2
+                cost_b = _cost(d0, 2, scale) + _cost(d1, 1, scale)   # d0→2, d1→1
+                if cost_a <= cost_b:
+                    dancers[1], dancers[2]         = d0["kps"], d1["kps"]
+                    last_center[1], last_center[2] = d0["center"], d1["center"]
                 else:
-                    dancers[1], dancers[2] = dets[1]["kps"], dets[0]["kps"]
-                    last_center[1], last_center[2] = c1, c0
+                    dancers[1], dancers[2]         = d1["kps"], d0["kps"]
+                    last_center[1], last_center[2] = d1["center"], d0["center"]
 
         frames_out.append({
             "frame_idx": rec["frame_idx"],

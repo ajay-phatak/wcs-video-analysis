@@ -54,7 +54,8 @@ def _fmt_time(secs: float) -> str:
 # Report sections
 # ---------------------------------------------------------------------------
 
-def _header(video_path: str, pose_data: dict, metrics: dict, lines: list):
+def _header(video_path: str, pose_data: dict, metrics: dict, lines: list,
+            you_id: int | None = None, me: str | None = None):
     fps    = pose_data["fps"]
     frames = pose_data["frame_count"]
     ids    = pose_data.get("dancer_ids", [])
@@ -69,8 +70,12 @@ def _header(video_path: str, pose_data: dict, metrics: dict, lines: list):
         f"  Duration  : {_fmt_time(dur)}  ({frames} frames @ {fps:.1f} fps)",
         f"  Dancers   : {len(ids)} tracked  (IDs: {ids})",
         f"  Lead ID   : {ids[0] if ids else '?'}    Follow ID: {ids[1] if len(ids) > 1 else '?'}",
-        "",
     ]
+    if you_id in (1, 2):
+        col = "lead" if you_id == 1 else "follow"
+        side_txt = f", started on the {me}" if me in ("left", "right") else ""
+        lines.append(f"  You (lead): Dancer {you_id} (the '{col}' column below{side_txt})")
+    lines.append("")
 
     tq = metrics.get("tracking_quality", {})
     if tq:
@@ -134,6 +139,18 @@ def _leg_action_section(label: str, data: dict, coverage_pct: float, lines: list
     wo_trav  = data.get("step_count_weight_only_traveling", 0)
     wo_ip    = data.get("step_count_weight_only_in_place", 0)
 
+    art_n        = data.get("art_step_count",            0)
+    art_fknee    = data.get("art_free_knee_flex_deg",    0.0)
+    art_fhip     = data.get("art_free_hip_flex_deg",     0.0)
+    art_wknee    = data.get("art_weighted_knee_flex_deg", 0.0)
+    art_fknee90  = data.get("art_free_knee_p90",         0.0)
+    art_wknee90  = data.get("art_weighted_knee_p90",     0.0)
+    art_coord    = data.get("art_knee_hip_coord",        0.0)
+    art_smooth   = data.get("art_smoothness",            0.0)
+    art_straighten = data.get("art_straighten_pct",      0.0)
+    art_prep     = data.get("art_prep_pct",              0.0)
+    art_ankle    = data.get("art_ankle_lift",            0.0)
+
     def _pct(n, d):
         return (100.0 * n / d) if d > 0 else 0.0
 
@@ -152,6 +169,25 @@ def _leg_action_section(label: str, data: dict, coverage_pct: float, lines: list
         f"    Knee flexion (norm)     : mean {kf_mean:.3f}  max {kf_max:.3f}{_flag(kf_mean, 0.2, 0.35)}",
         f"    Knee flex at art. steps : {kf_art:.3f}{_flag(kf_art, 0.22, 0.38)}",
         f"      (0 = straight leg, 0.5 = deep bend; articulated steps should show more flex)",
+        "",
+        "  ARTICULATION QUALITY  (on articulated steps — free/moving leg vs standing leg)",
+        DIV,
+        f"    Steps analysed          : {art_n}",
+        f"    Free-leg prep flexion   : knee {art_fknee:.1f}° (p90 {art_fknee90:.0f}°)   hip {art_fhip:.1f}°",
+        f"      (the MOVING leg bending while the foot is free, to gather/prepare the step)",
+        f"    Standing-leg flexion    : knee {art_wknee:.1f}° (p90 {art_wknee90:.0f}°)   (the weighted leg sinking/loading — 'getting lower')",
+        f"      (median is the typical step; p90 is how deep they go on their biggest steps — the dynamic range)",
+        f"    Free knee↔hip coord     : {art_coord:+.2f}{_flag(art_coord, 0.3, 0.6)}",
+        f"      (do the gathering leg's knee & hip flex together? + = proportional, ~0 = knee-only or hip-only)",
+        f"    Bend smoothness         : {_pct_bar(art_smooth * 100)}{_flag(art_smooth, 0.5, 0.7)}",
+        f"      (1.0 = one clean prep→rise on the moving leg; lower = jittery/segmented)",
+        f"    Straighten recovery     : {_pct_bar(art_straighten)}{_flag(art_straighten, 50, 75)}",
+        f"      (% of the moving-leg bend re-straightened — the rise as weight arrives on the new foot)",
+        f"    Prep→arrival sequencing : {_pct_bar(art_prep)}{_flag(art_prep, 40, 65)}",
+        f"      (% of steps where the bend happens while the foot is free (prep), then straightens after it grounds)",
+        f"    Ankle lift (proxy)      : {art_ankle:.3f} BH",
+        f"      (moving-foot vertical excursion — push through the ball of foot; NOT a true ankle angle)",
+        f"      (note: joint angles are 2-D side-on estimates; musical accents e.g. deep lunges are valid exceptions)",
         "",
         f"    Rise/fall (typical)     : {rf_typ:.3f}  (median bounce on average steps)",
         f"    Rise/fall (dynamic)     : {rf_dyn:.3f}  (95th-pct — biggest level changes)",
@@ -291,12 +327,25 @@ def _musicality_section(data: dict, lines: list):
     six_ct     = data.get("six_count_patterns", 0)
     eight_ct   = data.get("eight_count_patterns", 0)
     phrase_ct  = data.get("phrase_count",       0)
+    bounciness = data.get("song_bounciness",    0.0)
+    dyn_range  = data.get("song_dynamic_range", 0.0)
+    accent_ct  = data.get("accent_count",       0)
 
     def v(key):
         return data.get(key, 0.0)
 
+    def ch(key):
+        return data.get(key, "none")
+
     lines += [
         f"    Detected tempo          : {tempo:.1f} BPM  ({beats} beats)",
+        "",
+        "  SONG CHARACTER",
+        DIV,
+        f"    Bounciness (bouncy↔smooth): {_pct_bar(bounciness * 100)}",
+        f"      (high = punchy/percussive song; low = smooth/legato — what the music asks of movement)",
+        f"    Dynamic range           : {dyn_range:.2f}  (energy spread; higher = bigger swells/drops)",
+        f"    Accents detected        : {accent_ct}  (hits/breaks/stabs found throughout the song)",
         "",
         "  FREE ARM STYLING",
         DIV,
@@ -312,8 +361,12 @@ def _musicality_section(data: dict, lines: list):
         f"      Lead                  : {v('wrist_speed_a'):.3f}",
         f"      Follow                : {v('wrist_speed_b'):.3f}",
         "",
-        "  TEXTURE",
+        "  TEXTURE  (does movement quality match the song's character?)",
         DIV,
+        f"    Texture match (bouncy↔smooth)",
+        f"      Lead                  : {v('texture_match_a'):+.3f}{_flag(v('texture_match_a'), 0.2, 0.45)}",
+        f"      Follow                : {v('texture_match_b'):+.3f}{_flag(v('texture_match_b'), 0.2, 0.45)}",
+        f"      (time-resolved Pearson r: + = movement gets bouncier in punchy sections, smoother in legato ones)",
         f"    Bounce match (beat rhythm)",
         f"      Lead                  : {_pct_bar(v('bounce_match_a') * 100)}{_flag(v('bounce_match_a'), 0.4, 0.7)}",
         f"      Follow                : {_pct_bar(v('bounce_match_b') * 100)}{_flag(v('bounce_match_b'), 0.4, 0.7)}",
@@ -332,16 +385,24 @@ def _musicality_section(data: dict, lines: list):
         f"      Lead                  : {_pct_bar(v('syncopation_pct_a'))}",
         f"      Follow                : {_pct_bar(v('syncopation_pct_b'))}",
         "",
-        "  PHRASE CHANGES",
+        "  MUSICAL EXPRESSION  (accents & phrases — any channel counts)",
         DIV,
+        f"    Accent response (across all {accent_ct} accents)",
+        f"      Lead                  : {_pct_bar(v('accent_response_pct_a'))}{_flag(v('accent_response_pct_a'), 35, 65)}  via {ch('accent_dominant_channel_a')}",
+        f"      Follow                : {_pct_bar(v('accent_response_pct_b'))}{_flag(v('accent_response_pct_b'), 35, 65)}  via {ch('accent_dominant_channel_b')}",
+        f"      (% of musical accents marked by a notable move in ANY channel: feet / chest / hands / head)",
+        f"    Accent hit intensity (typical)",
+        f"      Lead                  : {v('accent_hit_mean_a'):.2f}×  strongest-channel burst vs a typical moment",
+        f"      Follow                : {v('accent_hit_mean_b'):.2f}×  strongest-channel burst vs a typical moment",
         f"    Phrase boundaries       : {phrase_ct}  (every 32 beats = 8 bars of 4/4)",
-        f"    Arm activity at phrase  ",
+        f"    Activity at phrase changes (multichannel)",
         f"      Lead                  : {_pct_bar(v('phrase_rsp_pct_a'))}{_flag(v('phrase_rsp_pct_a'), 30, 60)}",
         f"      Follow                : {_pct_bar(v('phrase_rsp_pct_b'))}{_flag(v('phrase_rsp_pct_b'), 30, 60)}",
-        f"      (% of phrase changes where wrist speed ≥ 1.5× clip baseline — likely a hit or styling moment)",
-        f"    Phrase hit intensity",
-        f"      Lead                  : {v('phrase_hit_mean_a'):.2f}×  baseline wrist speed",
-        f"      Follow                : {v('phrase_hit_mean_b'):.2f}×  baseline wrist speed",
+        f"    Partnership coverage    : {_pct_bar(v('accent_covered_pct'))}{_flag(v('accent_covered_pct'), 50, 75)}",
+        f"      (% of accents expressed by EITHER partner — the moment lands even if one frames the other)",
+        f"    Framing (one goes still so the other expresses)",
+        f"      Lead frames Follow    : {_pct_bar(v('frame_a_for_b_pct'))}",
+        f"      Follow frames Lead    : {_pct_bar(v('frame_b_for_a_pct'))}",
         "",
         f"    WCS pattern fingerprint",
         f"      6-count sequences     : {six_ct}",
@@ -411,10 +472,59 @@ def _flags_section(metrics: dict, lines: list):
 # Main report builder
 # ---------------------------------------------------------------------------
 
-def build_report(video_path: str, pose_data: dict, metrics: dict) -> str:
+def _movement_detail_section(metrics: dict, lines: list):
+    """Deep per-step detail: distributions (ceiling vs steady), accent-vs-anchor
+    timing, and how step amplitude is regulated. Always shown."""
+    detail = metrics.get("movement_quality_detail", {})
+    if not any((detail.get(l) or {}).get("step_count", 0) for l in ("lead", "follow")):
+        return
+
+    lines += [
+        SEP,
+        "  MOVEMENT-QUALITY & MUSICALITY DETAIL",
+        SEP,
+        "  (medians hide it: this is the distribution, the accent timing, and how step size is regulated)",
+        "",
+    ]
+
+    def _cpl(v):
+        return f"{v:+.2f}" if v is not None else " n/a (too few/!varied)"
+
+    for label in ("lead", "follow"):
+        d = detail.get(label) or {}
+        if d.get("step_count", 0) == 0:
+            continue
+        wk = d["dist_weighted_knee"]
+        fk = d["dist_free_knee"]
+        al = d["dist_ankle_lift"]
+        lines += [
+            f"  {label.upper()}  ({d['step_count']} articulated steps)",
+            DIV,
+            "    Bend depth distribution (deg of knee flexion per step)",
+            f"      Standing leg          : median {wk['p50']:.0f}°   p75 {wk['p75']:.0f}°   p90 {wk['p90']:.0f}°   max {wk['max']:.0f}°",
+            f"      Free (prep) leg       : median {fk['p50']:.0f}°   p90 {fk['p90']:.0f}°   max {fk['max']:.0f}°",
+            f"      (a wide median→p90 spread = big dynamic range / 'goes for it' on some steps;",
+            f"       a low ceiling = compressed range, rarely sinks deep)",
+            f"      Ankle lift (proxy, BH): median {al['p50']:.2f}   p90 {al['p90']:.2f}",
+            "",
+            f"    Accent vs anchor  ({d['accent_n']} of {d['step_count']} steps land on a musical accent)",
+            f"      Standing-leg flex     : {d['wt_knee_accent']:.0f}° on accents   vs   {d['wt_knee_nonaccent']:.0f}° off",
+            f"      Free-leg prep flex    : {d['free_knee_accent']:.0f}° on accents   vs   {d['free_knee_nonaccent']:.0f}° off",
+            f"      (deeper ON accents = loads to mark the music; deeper OFF = depth lives on anchors/settles)",
+            "",
+            f"    Amplitude regulation  (Pearson r across steps; how step size is controlled)",
+            f"      Foot-lift  ↔ prep flex : {_cpl(d['coupling_lift_flex'])}   (picks the foot up more when the leg gathers more)",
+            f"      Body-pitch ↔ prep flex : {_cpl(d['coupling_pitch_flex'])}   (tilts into it more on bigger gathers)",
+            f"      Standing sink ↔ COM drop: {_cpl(d['coupling_sink_comdrop'])}   (weighted-leg bend actually lowers the body)",
+            "",
+        ]
+
+
+def build_report(video_path: str, pose_data: dict, metrics: dict,
+                 you_id: int | None = None, me: str | None = None) -> str:
     lines = []
 
-    _header(video_path, pose_data, metrics, lines)
+    _header(video_path, pose_data, metrics, lines, you_id=you_id, me=me)
 
     tq = metrics.get("tracking_quality", {})
     for i, label in enumerate(["lead", "follow"]):
@@ -426,6 +536,7 @@ def build_report(video_path: str, pose_data: dict, metrics: dict) -> str:
 
     _weight_countering_section(metrics.get("weight_countering", {}), lines)
     _musicality_section(metrics.get("musicality", {}), lines)
+    _movement_detail_section(metrics, lines)
     _flags_section(metrics, lines)
 
     return "\n".join(lines)
