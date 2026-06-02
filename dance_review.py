@@ -250,6 +250,53 @@ def _body_action_section(label: str, data: dict, coverage_pct: float, lines: lis
     ]
 
 
+def _travel_section(metrics: dict, lines: list, spotlight: bool = False):
+    """Render the three travel types: couple-around-room, down-slot, stretch/compression."""
+    travel = metrics.get("travel", {})
+    t_lead = metrics.get("travel_lead", {})
+    t_foll = metrics.get("travel_follow", {})
+    wc     = metrics.get("weight_countering", {})
+
+    lines += [
+        SEP,
+        "  TRAVEL DECOMPOSITION (PARTNERSHIP)",
+        SEP,
+        "",
+    ]
+    if not travel:
+        lines += ["    [!] insufficient data for travel decomposition", ""]
+        return
+
+    couple_path  = travel.get("couple_travel_path_bh", 0.0)
+    couple_range = travel.get("couple_travel_range_bh", 0.0)
+    slot_deg     = travel.get("slot_axis_deg", 0.0)
+    note = "" if spotlight else "   (not spotlight — lower is expected)"
+
+    lines += [
+        f"  (a) COUPLE AROUND THE ROOM",
+        DIV,
+        f"    Centroid range (BH)     : {couple_range:.3f}{note}",
+        f"      (how far across the floor the couple's shared centre spanned)",
+        f"    Centroid path (BH)      : {couple_path:.3f}",
+        f"      (cumulative low-passed centroid travel; secondary)",
+        "",
+        f"  (b) DOWN THE SLOT (per dancer, absolute along the slot axis)",
+        DIV,
+        f"    Lead slot travel (BH)   : range {t_lead.get('slot_travel_range_bh', 0.0):.3f}   "
+        f"path {t_lead.get('slot_travel_path_bh', 0.0):.3f}",
+        f"    Follow slot travel (BH) : range {t_foll.get('slot_travel_range_bh', 0.0):.3f}   "
+        f"path {t_foll.get('slot_travel_path_bh', 0.0):.3f}",
+        f"      (movement along the slot axis at {slot_deg:.1f}° from horizontal)",
+        "",
+        f"  (c) STRETCH / COMPRESSION (movement after a post)",
+        DIV,
+        f"    Peak stretch (mean)     : {wc.get('post_max_stretch_mean', 0.0):.3f} BH",
+        f"    Peak compression (mean) : {wc.get('post_max_compression_mean', 0.0):.3f} BH",
+        f"      (centre movement anchored off a post — see POST DYNAMICS below)",
+        "",
+    ]
+
+
 def _weight_countering_section(data: dict, lines: list):
     lines += [
         SEP,
@@ -273,6 +320,8 @@ def _weight_countering_section(data: dict, lines: list):
     counter     = data.get("counter_balance_pct", 0.0)
     slot_deg    = data.get("slot_direction_deg", 0.0)
     post_count  = data.get("post_count", 0)
+    post_sl     = data.get("post_stretch_leading", 0)
+    post_cl     = data.get("post_compression_leading", 0)
     post_str    = data.get("post_max_stretch_mean", 0.0)
     post_cmp    = data.get("post_max_compression_mean", 0.0)
 
@@ -298,10 +347,14 @@ def _weight_countering_section(data: dict, lines: list):
         f"  POST DYNAMICS",
         DIV,
         f"    Posts detected          : {post_count}",
-        f"      (connection point stationary ≥ 0.18 s — anchor for stretch/compression)",
+        f"      (connection still ALONG THE SLOT ≥ 0.18 s — vertical movement from",
+        f"       stretch/compression allowed; anchor for stretch/compression)",
     ]
     if post_count > 0:
         lines += [
+            f"    Anchor to SEND (stretch): {post_sl}   "
+            f"Anchor to RECEIVE (compress): {post_cl}",
+            f"      (how many posts are followed mainly by stretch vs compression)",
             f"    Peak stretch (mean)     : {post_str:.3f} BH{_flag(post_str, 0.05, 0.15)}",
             f"      — how far dancers moved apart after the post, in body heights",
             f"    Peak compression (mean) : {post_cmp:.3f} BH",
@@ -521,10 +574,14 @@ def _movement_detail_section(metrics: dict, lines: list):
 
 
 def build_report(video_path: str, pose_data: dict, metrics: dict,
-                 you_id: int | None = None, me: str | None = None) -> str:
+                 you_id: int | None = None, me: str | None = None,
+                 spotlight: bool = False) -> str:
     lines = []
 
     _header(video_path, pose_data, metrics, lines, you_id=you_id, me=me)
+
+    clip_type = "spotlight (full-floor)" if spotlight else "contained (prelim/practice)"
+    lines += [f"  Clip type               : {clip_type}", ""]
 
     tq = metrics.get("tracking_quality", {})
     for i, label in enumerate(["lead", "follow"]):
@@ -534,6 +591,7 @@ def build_report(video_path: str, pose_data: dict, metrics: dict,
         if f"body_action_{label}" in metrics:
             _body_action_section(label, metrics[f"body_action_{label}"], cov, lines)
 
+    _travel_section(metrics, lines, spotlight)
     _weight_countering_section(metrics.get("weight_countering", {}), lines)
     _musicality_section(metrics.get("musicality", {}), lines)
     _movement_detail_section(metrics, lines)

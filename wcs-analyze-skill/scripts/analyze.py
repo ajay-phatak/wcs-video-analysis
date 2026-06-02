@@ -251,7 +251,7 @@ def _cols_for(dancer_id: int) -> tuple:
 
 
 def _gap_report(am_metrics: dict, pro_entries: list, you_id: int = 1,
-                include_partner: bool = False) -> str:
+                include_partner: bool = False, spotlight: bool = False) -> str:
     """Build a concise gap-comparison table (you vs pro average).
 
     `you_id` is the tracked Dancer ID that is YOU (the lead) in this video. Role-
@@ -303,6 +303,7 @@ def _gap_report(am_metrics: dict, pro_entries: list, you_id: int = 1,
         ("1-foot balance %",                         "leg_action",  "one_foot_pct",                     "side", True,  ".1f"),
         ("Weight-only traveling (lower=better)",     "leg_action",  "step_count_weight_only_traveling", "side", False, ".0f"),
         ("Articulated traveling",                    "leg_action",  "step_count_articulated_traveling", "side", True,  ".0f"),
+        ("Slot travel range (down-slot, BH)",        "travel",      "slot_travel_range_bh",             "side", True,  ".3f"),
         ("Art. free-leg prep knee flex (deg)",       "leg_action",  "art_free_knee_flex_deg",           "side", True,  ".1f"),
         ("Art. free-leg prep hip flex (deg)",        "leg_action",  "art_free_hip_flex_deg",            "side", True,  ".1f"),
         ("Art. standing-leg knee flex med (deg)",    "leg_action",  "art_weighted_knee_flex_deg",       "side", True,  ".1f"),
@@ -323,9 +324,13 @@ def _gap_report(am_metrics: dict, pro_entries: list, you_id: int = 1,
     ]
     # Role-agnostic partnership metrics, emitted once — (label, category, subkey, hib, fmt)
     pair_checks = [
-        ("Partner distance variance",  "weight_countering", "partner_distance_std", True, ".3f"),
-        ("Posts detected",             "weight_countering", "post_count",           True, ".0f"),
-        ("Accent coverage % (either)", "musicality",        "accent_covered_pct",   True, ".1f"),
+        ("Partner distance variance",          "weight_countering", "partner_distance_std",   True, ".3f"),
+        ("Posts detected",                     "weight_countering", "post_count",             True, ".0f"),
+        ("Posts: anchor-to-send (stretch)",    "weight_countering", "post_stretch_leading",   True, ".0f"),
+        ("Posts: anchor-to-receive (compress)","weight_countering", "post_compression_leading",True, ".0f"),
+        ("Stretch/compression after post (BH)","weight_countering", "post_max_stretch_mean",  True, ".3f"),
+        ("Couple travel around room (BH)",     "travel",            "couple_travel_range_bh", True, ".3f"),
+        ("Accent coverage % (either)",         "musicality",        "accent_covered_pct",     True, ".1f"),
     ]
 
     roles = ["you", "partner"] if include_partner else ["you"]
@@ -342,7 +347,7 @@ def _gap_report(am_metrics: dict, pro_entries: list, you_id: int = 1,
         "=" * 72,
     ]
 
-    def _emit(label, am_val, pa, hib, fmt, suffix, vlabel):
+    def _emit(label, am_val, pa, hib, fmt, suffix, vlabel, note=""):
         if am_val is None or pa is None:
             return
         delta = am_val - pa
@@ -350,7 +355,7 @@ def _gap_report(am_metrics: dict, pro_entries: list, you_id: int = 1,
         sign  = "+" if delta >= 0 else ""
         lines.append(
             f"  {label + suffix:<46s}  {vlabel}={am_val:{fmt}}  pro avg={pa:{fmt}}  "
-            f"{arrow} {sign}{delta:{fmt}}"
+            f"{arrow} {sign}{delta:{fmt}}{note}"
         )
 
     for role in roles:
@@ -363,8 +368,11 @@ def _gap_report(am_metrics: dict, pro_entries: list, you_id: int = 1,
     if include_partner:
         lines.append("  -- PARTNERSHIP (both) --")
     for label, category, subkey, hib, fmt in pair_checks:
+        note = ""
+        if subkey == "couple_travel_range_bh" and not spotlight:
+            note = "   (not spotlight — lower expected)"
         _emit(label, _am(category, subkey, "pair", "you"), _pro_avg(category, subkey, "pair", "you"),
-              hib, fmt, "", "you")
+              hib, fmt, "", "you", note=note)
 
     lines += ["", "=" * 72]
     return "\n".join(lines)
@@ -391,6 +399,11 @@ def main():
     parser.add_argument("--partner", action="store_true",
                         help="Also show the follower's comparison (your partner vs each pro's "
                              "follow) in the gap analysis, not just the lead's.")
+    parser.add_argument("--spotlight", action="store_true",
+                        help="Mark this clip as a spotlight (full-floor showcase). When set, "
+                             "couple-around-the-room travel is compared to the pro baseline "
+                             "normally. Otherwise the clip is treated as contained (prelim/"
+                             "practice) and that one gap row is annotated 'lower expected'.")
     args = parser.parse_args()
 
     # ── step 1: resolve input to a local video file ──────────────────────────
@@ -421,11 +434,13 @@ def main():
     # ── step 3: metrics ──────────────────────────────────────────────────────
     print("  Computing metrics …")
     metrics = dm.compute_all_metrics(poses)
+    metrics["spotlight"] = bool(args.spotlight)
 
     # ── step 4: report ───────────────────────────────────────────────────────
     print("  Building report …\n")
     report = dr.build_report(str(video_path), poses, metrics, you_id=you_id,
-                             me=(None if args.me_id is not None else args.me))
+                             me=(None if args.me_id is not None else args.me),
+                             spotlight=args.spotlight)
 
     report_path = out_dir / (video_path.stem + "_report.txt")
     report_path.write_text(report, encoding="utf-8")
@@ -443,7 +458,7 @@ def main():
 
         if pro_entries:
             gap = _gap_report(metrics, pro_entries, you_id=you_id,
-                              include_partner=args.partner)
+                              include_partner=args.partner, spotlight=args.spotlight)
             print(gap)
             gap_path = out_dir / (video_path.stem + "_gap_analysis.txt")
             gap_path.write_text(gap, encoding="utf-8")

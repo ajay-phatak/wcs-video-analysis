@@ -1178,22 +1178,63 @@ def _connection_type(kps_a: np.ndarray, kps_b: np.ndarray, bh_a: float, bh_b: fl
     return "none", (tc_a + tc_b) / 2.0
 
 
+def _slot_axis(frames: list, dancer_ids: list[int]) -> tuple[np.ndarray, float]:
+    """
+    Estimate the slot axis: the dominant spatial direction the partnership occupies.
+
+    PCA over the stacked per-frame hip centres of BOTH dancers across the clip.
+    For a roughly side-on camera this is the line the dancers travel along, which
+    is what 'horizontal'/'down the slot' means for posts and travel decomposition.
+
+    Returns (unit_vector_xy, angle_deg_from_horizontal). Falls back to the image
+    horizontal axis (1, 0) when there is insufficient data.
+    """
+    if len(dancer_ids) < 2:
+        return np.array([1.0, 0.0]), 0.0
+    id_a, id_b = dancer_ids[0], dancer_ids[1]
+    pts: list[list[float]] = []
+    for f in frames:
+        d = f.get("dancers", {})
+        for did in (id_a, id_b):
+            if did in d:
+                c = get_center(d[did])
+                if c[2] >= CONF_MIN:
+                    pts.append([float(c[0]), float(c[1])])
+    if len(pts) < 10:
+        return np.array([1.0, 0.0]), 0.0
+    arr = np.array(pts)
+    arr = arr - arr.mean(axis=0)
+    cov = np.cov(arr.T)
+    evals, evecs = np.linalg.eig(cov)
+    principal = np.real(evecs[:, int(np.argmax(np.real(evals)))])
+    norm = np.linalg.norm(principal)
+    if norm < 1e-9:
+        return np.array([1.0, 0.0]), 0.0
+    u = principal / norm
+    angle = float(np.degrees(np.arctan2(u[1], u[0])))
+    return u, angle
+
+
 def _detect_posts(
     times: np.ndarray,
     conn_xy: np.ndarray,   # (N, 2) connection point positions in pixels
     center_a: np.ndarray,  # (N, 2) dancer A hip centres
     center_b: np.ndarray,  # (N, 2) dancer B hip centres
     bh_mean: float,
+    slot_axis: np.ndarray,
 ) -> dict:
     """
-    Detect 'post' moments: periods when the connection point stops traveling,
-    giving both dancers a fixed anchor to stretch away from or compress into.
+    Detect 'post' moments: periods when the connection point stops traveling
+    ALONG THE SLOT, giving both dancers a fixed anchor to stretch away from or
+    compress into.  Stretch and compression legitimately move the hand vertically
+    (and slightly perpendicular), so stillness is measured only along the slot
+    axis — vertical/perpendicular hand motion no longer breaks a post.
 
-    A post is detected when the smoothed connection-point speed drops below
-    POST_SPEED_THRESH (in body-heights per second) for at least MIN_POST_DURATION
-    seconds.  For each detected post, the partner distance at initiation is used
-    as the baseline, and the maximum stretch / compression achieved in the
-    following POST_MEASURE_WIN seconds is recorded.
+    A post is detected when the smoothed connection-point slot-axis speed drops
+    below POST_SPEED_THRESH (in body-heights per second) for at least
+    MIN_POST_DURATION seconds.  For each detected post, the partner distance at
+    initiation is used as the baseline, and the maximum stretch / compression
+    achieved in the following POST_MEASURE_WIN seconds is recorded.
 
     Returns:
         {
@@ -1207,15 +1248,23 @@ def _detect_posts(
     POST_MEASURE_WIN  = 1.5    # seconds after post start to measure stretch/compression
 
     if len(times) < 10:
-        return {"post_count": 0, "post_max_stretch_mean": 0.0,
+        return {"post_count": 0, "post_stretch_leading": 0,
+                "post_compression_leading": 0, "post_max_stretch_mean": 0.0,
                 "post_max_compression_mean": 0.0}
 
-    # Smooth connection-point path then compute speed
+    # Smooth connection-point path then compute speed ALONG THE SLOT only.
+    # Project the per-frame displacement onto the slot unit vector so that
+    # vertical/perpendicular motion (from stretch/compression) is ignored.
     conn_x_sm = _smooth(conn_xy[:, 0]) if len(conn_xy) >= SMOOTH_WINDOW else conn_xy[:, 0]
     conn_y_sm = _smooth(conn_xy[:, 1]) if len(conn_xy) >= SMOOTH_WINDOW else conn_xy[:, 1]
 
+    u  = np.asarray(slot_axis, dtype=float)
+    nu = np.linalg.norm(u)
+    u  = u / nu if nu > 1e-9 else np.array([1.0, 0.0])
+
     dt_arr = np.diff(times)
-    speed  = np.sqrt(np.diff(conn_x_sm)**2 + np.diff(conn_y_sm)**2) / (dt_arr * bh_mean + 1e-6)
+    d_slot = np.diff(conn_x_sm) * u[0] + np.diff(conn_y_sm) * u[1]
+    speed  = np.abs(d_slot) / (dt_arr * bh_mean + 1e-6)
     speed_sm = _smooth(speed) if len(speed) >= SMOOTH_WINDOW else speed
     t_mid    = (times[:-1] + times[1:]) / 2.0  # timestamps for each speed sample
 
@@ -1235,12 +1284,17 @@ def _detect_posts(
         raw_posts.append((post_start_i, len(speed_sm) - 1))
 
     if not raw_posts:
-        return {"post_count": 0, "post_max_stretch_mean": 0.0,
+        return {"post_count": 0, "post_stretch_leading": 0,
+                "post_compression_leading": 0, "post_max_stretch_mean": 0.0,
                 "post_max_compression_mean": 0.0}
 
-    # For each post: measure stretch / compression relative to partner distance at initiation
+    # For each post: measure stretch / compression relative to partner distance at
+    # initiation, and classify the post by which dominates afterwards (does the
+    # dancer anchor to SEND/stretch, or to RECEIVE/compress?).
     stretches:     list[float] = []
     compressions:  list[float] = []
+    stretch_leading     = 0
+    compression_leading = 0
 
     for start_i, _end_i in raw_posts:
         post_t = float(t_mid[start_i])
@@ -1257,15 +1311,24 @@ def _detect_posts(
             continue
 
         dists = np.linalg.norm(center_a[win] - center_b[win], axis=1) / bh_mean
-        stretches.append(max(0.0, float(np.max(dists)) - d0))
-        compressions.append(max(0.0, d0 - float(np.min(dists))))
+        s = max(0.0, float(np.max(dists)) - d0)
+        c = max(0.0, d0 - float(np.min(dists)))
+        stretches.append(s)
+        compressions.append(c)
+        if s >= c:
+            stretch_leading += 1
+        else:
+            compression_leading += 1
 
     if not stretches:
-        return {"post_count": 0, "post_max_stretch_mean": 0.0,
+        return {"post_count": 0, "post_stretch_leading": 0,
+                "post_compression_leading": 0, "post_max_stretch_mean": 0.0,
                 "post_max_compression_mean": 0.0}
 
     return {
         "post_count":                len(stretches),
+        "post_stretch_leading":      stretch_leading,
+        "post_compression_leading":  compression_leading,
         "post_max_stretch_mean":     round(float(np.mean(stretches)),     3),
         "post_max_compression_mean": round(float(np.mean(compressions)),  3),
     }
@@ -1275,6 +1338,7 @@ def compute_weight_countering(
     frames: list,
     dancer_ids: list[int],
     fps: float,
+    slot_axis: np.ndarray | None = None,
 ) -> dict:
     """
     Partnership metrics relative to the detected connection point.
@@ -1290,11 +1354,16 @@ def compute_weight_countering(
         counter_balance_pct          float  (% frames both dancers lean away from each other)
         slot_direction_deg           float  (dominant movement axis, degrees from horizontal)
         post_count                   int    (number of post moments detected)
+        post_stretch_leading         int    (posts followed mainly by stretch — anchor to SEND)
+        post_compression_leading     int    (posts followed mainly by compression — anchor to RECEIVE)
         post_max_stretch_mean        float  (mean peak stretch after a post, in body heights)
         post_max_compression_mean    float  (mean peak compression after a post, in body heights)
     """
     if len(dancer_ids) < 2:
         return {"error": "need 2 dancers for partnership metrics"}
+
+    if slot_axis is None:
+        slot_axis, _ = _slot_axis(frames, dancer_ids)
 
     id_a, id_b = dancer_ids[0], dancer_ids[1]
 
@@ -1405,7 +1474,8 @@ def compute_weight_countering(
 
     # Post detection
     bh_mean = float(np.mean(bh_samples)) if bh_samples else 1.0
-    post_metrics = {"post_count": 0, "post_max_stretch_mean": 0.0,
+    post_metrics = {"post_count": 0, "post_stretch_leading": 0,
+                    "post_compression_leading": 0, "post_max_stretch_mean": 0.0,
                     "post_max_compression_mean": 0.0}
     if len(post_t_list) >= 10:
         post_metrics = _detect_posts(
@@ -1414,6 +1484,7 @@ def compute_weight_countering(
             np.array(post_ca_list),
             np.array(post_cb_list),
             bh_mean,
+            slot_axis,
         )
 
     return {
@@ -1427,8 +1498,120 @@ def compute_weight_countering(
         "counter_balance_pct":       round(100 * counter_frames / max(total_frames, 1), 1),
         "slot_direction_deg":        round(slot_direction_deg, 1),
         "post_count":                post_metrics["post_count"],
+        "post_stretch_leading":      post_metrics["post_stretch_leading"],
+        "post_compression_leading":  post_metrics["post_compression_leading"],
         "post_max_stretch_mean":     post_metrics["post_max_stretch_mean"],
         "post_max_compression_mean": post_metrics["post_max_compression_mean"],
+    }
+
+
+def compute_travel(
+    frames: list,
+    dancer_ids: list[int],
+    fps: float,
+    slot_axis: np.ndarray | None = None,
+) -> dict:
+    """
+    Decompose partnership movement into three physically distinct travel types,
+    all normalised to mean body height (BH):
+
+      (a) couple_travel  — the couple relocating AROUND THE ROOM: path length and
+                           range of the heavily-smoothed partnership centroid
+                           (smoothing keeps sustained relocation, drops jitter).
+      (b) slot_travel     — a dancer travelling DOWN THE SLOT: per-dancer range/path
+                           of the dancer's centre projected onto the slot axis,
+                           measured RELATIVE TO THE CENTROID so couple relocation
+                           is not double-counted.
+      (c) stretch/compression movement — how far centres move after a post — is the
+                           existing post_max_stretch/compression (in weight_countering),
+                           surfaced under the travel grouping by the report.
+
+    Returns:
+        {
+          "slot_axis_deg":            float,
+          "couple_travel_path_bh":    float,
+          "couple_travel_range_bh":   float,
+          "lead":   {"slot_travel_range_bh": float, "slot_travel_path_bh": float},
+          "follow": {"slot_travel_range_bh": float, "slot_travel_path_bh": float},
+        }
+    Note: 'lead' is dancer_ids[0], 'follow' is dancer_ids[1] — the same role
+    convention as leg_action_lead / leg_action_follow.
+    """
+    empty_side = {"slot_travel_range_bh": 0.0, "slot_travel_path_bh": 0.0}
+    base = {"slot_axis_deg": 0.0, "couple_travel_path_bh": 0.0,
+            "couple_travel_range_bh": 0.0,
+            "lead": dict(empty_side), "follow": dict(empty_side)}
+    if len(dancer_ids) < 2:
+        return base
+
+    id_a, id_b = dancer_ids[0], dancer_ids[1]
+    if slot_axis is None:
+        slot_axis, _ = _slot_axis(frames, dancer_ids)
+    u  = np.asarray(slot_axis, dtype=float)
+    nu = np.linalg.norm(u)
+    u  = u / nu if nu > 1e-9 else np.array([1.0, 0.0])
+    slot_angle = float(np.degrees(np.arctan2(u[1], u[0])))
+    base["slot_axis_deg"] = round(slot_angle, 1)
+
+    mid_x: list[float] = []
+    mid_y: list[float] = []
+    a_proj: list[float] = []   # lead  centre projected onto slot axis (room frame, absolute)
+    b_proj: list[float] = []   # follow centre projected onto slot axis (room frame, absolute)
+    bh_samples: list[float] = []
+    for f in frames:
+        d = f.get("dancers", {})
+        if id_a not in d or id_b not in d:
+            continue
+        kps_a, kps_b = d[id_a], d[id_b]
+        bh_a, bh_b = body_height(kps_a), body_height(kps_b)
+        scale = (bh_a + bh_b) / 2.0
+        if scale < 10:
+            continue
+        bh_samples.append(scale)
+        c_a = get_center(kps_a)[:2]
+        c_b = get_center(kps_b)[:2]
+        mid = (c_a + c_b) / 2.0
+        mid_x.append(float(mid[0]))
+        mid_y.append(float(mid[1]))
+        # Absolute slot-axis position of each dancer (room frame). Measuring this
+        # absolutely — NOT relative to the 2-body centroid — keeps lead and follow
+        # distinct (relative-to-centroid makes them exact mirror images).
+        a_proj.append(float(np.dot(c_a, u)))
+        b_proj.append(float(np.dot(c_b, u)))
+
+    if len(mid_x) < SMOOTH_WINDOW + 2:
+        return base
+
+    bh_mean = float(np.mean(bh_samples)) if bh_samples else 1.0
+
+    def _lowpass(arr: np.ndarray, win: int) -> np.ndarray:
+        win = max(SMOOTH_WINDOW, win | 1)          # force odd, ≥ SMOOTH_WINDOW
+        if len(arr) <= win:
+            return _smooth(arr)
+        return savgol_filter(arr, win, 2)
+
+    # (a) couple around the room — STRONGLY low-passed centroid (≈1 s) so the metric
+    # reflects sustained relocation around the floor, not per-step jitter. 'range'
+    # (bounding extent) is the robust headline; 'path' (cumulative) is secondary.
+    slow_win = int(fps) if fps and fps > 0 else SMOOTH_WINDOW
+    mx = _lowpass(np.array(mid_x), slow_win)
+    my = _lowpass(np.array(mid_y), slow_win)
+    couple_path  = float(np.sum(np.sqrt(np.diff(mx) ** 2 + np.diff(my) ** 2))) / bh_mean
+    couple_range = float(np.hypot(mx.max() - mx.min(), my.max() - my.min())) / bh_mean
+
+    def _side(proj: list[float]) -> dict:
+        p = _smooth(np.array(proj))
+        rng  = float(p.max() - p.min()) / bh_mean
+        path = float(np.sum(np.abs(np.diff(p)))) / bh_mean
+        return {"slot_travel_range_bh": round(rng, 3),
+                "slot_travel_path_bh":  round(path, 3)}
+
+    return {
+        "slot_axis_deg":          round(slot_angle, 1),
+        "couple_travel_path_bh":  round(couple_path, 3),
+        "couple_travel_range_bh": round(couple_range, 3),
+        "lead":   _side(a_proj),
+        "follow": _side(b_proj),
     }
 
 
@@ -2166,7 +2349,19 @@ def compute_all_metrics(pose_data: dict) -> dict:
         metrics[f"leg_action_{label}"]  = compute_leg_action(frames, did, fps)
         metrics[f"body_action_{label}"] = compute_body_action(frames, did, fps)
 
-    metrics["weight_countering"] = compute_weight_countering(frames, ids[:2], fps)
+    slot_axis, _ = _slot_axis(frames, ids[:2])
+    metrics["weight_countering"] = compute_weight_countering(frames, ids[:2], fps, slot_axis)
+
+    # Travel decomposition: couple-around-room, down-the-slot (per dancer),
+    # and (via the post metrics in weight_countering) stretch/compression.
+    travel = compute_travel(frames, ids[:2], fps, slot_axis)
+    metrics["travel"] = {
+        "slot_axis_deg":          travel["slot_axis_deg"],
+        "couple_travel_path_bh":  travel["couple_travel_path_bh"],
+        "couple_travel_range_bh": travel["couple_travel_range_bh"],
+    }
+    metrics["travel_lead"]   = travel["lead"]
+    metrics["travel_follow"] = travel["follow"]
 
     # Pass pre-computed leg metrics so musicality doesn't re-run step detection
     leg_for_music = {

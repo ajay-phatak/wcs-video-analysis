@@ -70,7 +70,7 @@ ID directly (this overrides `--me`). Default is `--me left`.
 ### 2. Run the analysis script
 
 ```
-python wcs-analyze-skill/scripts/analyze.py "<input>" [--compare-pros] [--me left|right | --me-id 1|2] [--partner]
+python wcs-analyze-skill/scripts/analyze.py "<input>" [--compare-pros] [--me left|right | --me-id 1|2] [--partner] [--spotlight]
 ```
 
 - Pass `--me left` or `--me right` to say which side the user (the lead) starts on, or
@@ -86,6 +86,14 @@ python wcs-analyze-skill/scripts/analyze.py "<input>" [--compare-pros] [--me lef
   this when the user wants their partner's analysis too. You can then bridge the
   partner's gaps to notes the same way (the user's own notes are the lead's, so use the
   universal/follow-oriented concepts and say so).
+- Pass `--spotlight` when the clip is a **full-floor spotlight/showcase** (the couple is
+  meant to travel around the room). By default a clip is treated as **contained**
+  (prelim/practice), where staying compact is expected — so the *Couple travel around
+  room* gap row is annotated "lower expected" and should **not** be presented as a
+  deficiency. With `--spotlight` that row is compared to the pro baseline normally.
+  **Ask the user whether the clip is a spotlight** before running with `--compare-pros`,
+  since pro references are typically spotlights and the couple-travel comparison is only
+  apples-to-apples for another spotlight.
 - The script handles downloading, pose extraction caching, metric computation,
   and report generation automatically.
 - Pose extraction is slow (~3–5 min for a 3-min video at 25-60 fps). The script
@@ -270,6 +278,43 @@ When the user wants to add another pro video to expand the benchmark:
    compared against this dancer; partnership metrics (posts, distance variance,
    counter-balance) are role-agnostic and unaffected.
 3. Confirm with the user that the entry is added.
+
+---
+
+## Reading the travel & post metrics
+
+The report's **TRAVEL DECOMPOSITION** section breaks partnership movement into three
+physically distinct kinds of travel (all normalised to body heights, BH) — don't conflate
+them:
+
+1. **Couple around the room** — the couple's shared centre relocating around the floor.
+   Measured from a strongly low-passed (≈1 s) centroid: `couple_travel_range_bh` (bounding
+   extent, the robust headline used in the gap table) and `couple_travel_path_bh`
+   (cumulative, secondary). **Spotlight-sensitive**: only compare to pros when `--spotlight`
+   is set; in a contained prelim/practice clip, low room travel is correct, not a gap.
+2. **Down the slot** (per dancer) — each dancer's *absolute* position along the slot axis,
+   `travel_lead`/`travel_follow` → `slot_travel_range_bh` / `slot_travel_path_bh`. This is
+   how far the lead and the follow each traverse the slot (the follow usually travels more).
+   Measured absolutely (room frame) so lead and follow stay distinct.
+3. **Stretch / compression** — how far the centres move *after a post*; this is the existing
+   `post_max_stretch_mean` / `post_max_compression_mean`, surfaced here for grouping.
+
+**Posts** are now detected when the connection point is still **along the slot axis** (not
+fully 2-D still). Stretch and compression legitimately move the connecting hand *vertically*
+(up/down) and slightly out; requiring full stillness used to cut those posts short, so the
+count under-reported anchors. Expect noticeably more posts than the old 2-D test — that is
+the intended correction. The slot axis is a PCA fit over both dancers' centres
+(`travel.slot_axis_deg`); it should be near the partnership's `slot_direction_deg`.
+
+Posts are also split into **anchor-to-send** (`post_stretch_leading` — followed mainly by
+stretch) vs **anchor-to-receive** (`post_compression_leading` — followed mainly by
+compression). This is *descriptive*, not a gap: it shows whether the dancer tends to post in
+order to send the partner away (stretch) or to receive them in (compression). Use it to spot
+a lopsided habit (e.g. lots of send-anchors but few receive-anchors), not as a higher=better
+score.
+
+**Pro-baseline caveat:** couple-travel is partnership-level (more trustworthy); per-dancer
+slot-travel inherits the ~80% pro identity-stability caveat — hedge per-dancer pro deltas.
 
 ---
 
