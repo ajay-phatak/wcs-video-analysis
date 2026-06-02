@@ -287,34 +287,36 @@ The report's **TRAVEL DECOMPOSITION** section breaks partnership movement into t
 physically distinct kinds of travel (all normalised to body heights, BH) — don't conflate
 them:
 
-1. **Couple around the room** — the couple's shared centre relocating around the floor.
-   Measured from a strongly low-passed (≈1 s) centroid: `couple_travel_range_bh` (bounding
-   extent, the robust headline used in the gap table) and `couple_travel_path_bh`
-   (cumulative, secondary). **Spotlight-sensitive**: only compare to pros when `--spotlight`
-   is set; in a contained prelim/practice clip, low room travel is correct, not a gap.
-2. **Down the slot** (per dancer) — each dancer's *absolute* position along the slot axis,
-   `travel_lead`/`travel_follow` → `slot_travel_range_bh` / `slot_travel_path_bh`. This is
-   how far the lead and the follow each traverse the slot (the follow usually travels more).
-   Measured absolutely (room frame) so lead and follow stay distinct.
-3. **Stretch / compression** — how far the centres move *after a post*; this is the existing
+1. **Floor travel** — movement *of* the slot around the room: the couple's shared centre
+   relocating across the floor. Measured from a strongly low-passed (≈1 s) centroid:
+   `couple_travel_range_bh` (bounding extent, the robust headline used in the gap table) and
+   `couple_travel_path_bh` (cumulative, secondary). **Spotlight-sensitive**: only compare to
+   pros when `--spotlight` is set; in a contained prelim/practice clip, low floor travel is
+   correct, not a gap.
+2. **Slotted movement** — movement *down* the slot, per dancer: each dancer's *absolute*
+   position along the slot axis, `travel_lead`/`travel_follow` → `slot_travel_range_bh` /
+   `slot_travel_path_bh`. This is how far the lead and the follow each traverse the slot (the
+   follow usually travels more). Measured absolutely (room frame) so lead and follow stay
+   distinct.
+3. **Stretch range / Compression range** — how far the centres move *after a post*; this is
    `post_max_stretch_mean` / `post_max_compression_mean`, surfaced here for grouping.
 
 **Posts** are now detected when the connection point is still **along the slot axis** (not
 fully 2-D still). Stretch and compression legitimately move the connecting hand *vertically*
 (up/down) and slightly out; requiring full stillness used to cut those posts short, so the
-count under-reported anchors. Expect noticeably more posts than the old 2-D test — that is
-the intended correction. The slot axis is a PCA fit over both dancers' centres
+count under-reported them. Expect noticeably more posts than the old 2-D test — that is the
+intended correction. The slot axis is a PCA fit over both dancers' centres
 (`travel.slot_axis_deg`); it should be near the partnership's `slot_direction_deg`.
 
-Posts are also split into **anchor-to-send** (`post_stretch_leading` — followed mainly by
-stretch) vs **anchor-to-receive** (`post_compression_leading` — followed mainly by
-compression). This is *descriptive*, not a gap: it shows whether the dancer tends to post in
-order to send the partner away (stretch) or to receive them in (compression). Use it to spot
-a lopsided habit (e.g. lots of send-anchors but few receive-anchors), not as a higher=better
-score.
+Posts are also split into **stretch-leading** (`post_stretch_leading` — followed mainly by
+stretch) vs **compression-leading** (`post_compression_leading` — followed mainly by
+compression). This is *descriptive*, not a gap: it shows whether the dancer tends to post
+before stretching the partner away or before compressing them in. Use it to spot a lopsided
+habit (e.g. lots of stretch-leading but few compression-leading posts), not as a
+higher=better score.
 
-**Pro-baseline caveat:** couple-travel is partnership-level (more trustworthy); per-dancer
-slot-travel inherits the ~80% pro identity-stability caveat — hedge per-dancer pro deltas.
+**Pro-baseline caveat:** floor travel is partnership-level (more trustworthy); per-dancer
+slotted movement inherits the ~80% pro identity-stability caveat — hedge per-dancer pro deltas.
 
 ---
 

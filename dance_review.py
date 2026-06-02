@@ -273,25 +273,25 @@ def _travel_section(metrics: dict, lines: list, spotlight: bool = False):
     note = "" if spotlight else "   (not spotlight — lower is expected)"
 
     lines += [
-        f"  (a) COUPLE AROUND THE ROOM",
+        f"  (a) FLOOR TRAVEL  (movement OF the slot around the room)",
         DIV,
-        f"    Centroid range (BH)     : {couple_range:.3f}{note}",
+        f"    Floor travel range (BH) : {couple_range:.3f}{note}",
         f"      (how far across the floor the couple's shared centre spanned)",
-        f"    Centroid path (BH)      : {couple_path:.3f}",
+        f"    Floor travel path (BH)  : {couple_path:.3f}",
         f"      (cumulative low-passed centroid travel; secondary)",
         "",
-        f"  (b) DOWN THE SLOT (per dancer, absolute along the slot axis)",
+        f"  (b) SLOTTED MOVEMENT  (each dancer travelling down the slot)",
         DIV,
-        f"    Lead slot travel (BH)   : range {t_lead.get('slot_travel_range_bh', 0.0):.3f}   "
+        f"    Lead slotted move (BH)  : range {t_lead.get('slot_travel_range_bh', 0.0):.3f}   "
         f"path {t_lead.get('slot_travel_path_bh', 0.0):.3f}",
-        f"    Follow slot travel (BH) : range {t_foll.get('slot_travel_range_bh', 0.0):.3f}   "
+        f"    Follow slotted move (BH): range {t_foll.get('slot_travel_range_bh', 0.0):.3f}   "
         f"path {t_foll.get('slot_travel_path_bh', 0.0):.3f}",
         f"      (movement along the slot axis at {slot_deg:.1f}° from horizontal)",
         "",
-        f"  (c) STRETCH / COMPRESSION (movement after a post)",
+        f"  (c) STRETCH / COMPRESSION  (centre movement after a post)",
         DIV,
-        f"    Peak stretch (mean)     : {wc.get('post_max_stretch_mean', 0.0):.3f} BH",
-        f"    Peak compression (mean) : {wc.get('post_max_compression_mean', 0.0):.3f} BH",
+        f"    Stretch range (mean)    : {wc.get('post_max_stretch_mean', 0.0):.3f} BH",
+        f"    Compression range (mean): {wc.get('post_max_compression_mean', 0.0):.3f} BH",
         f"      (centre movement anchored off a post — see POST DYNAMICS below)",
         "",
     ]
@@ -348,16 +348,16 @@ def _weight_countering_section(data: dict, lines: list):
         DIV,
         f"    Posts detected          : {post_count}",
         f"      (connection still ALONG THE SLOT ≥ 0.18 s — vertical movement from",
-        f"       stretch/compression allowed; anchor for stretch/compression)",
+        f"       stretch/compression allowed; a fixed point to stretch/compress from)",
     ]
     if post_count > 0:
         lines += [
-            f"    Anchor to SEND (stretch): {post_sl}   "
-            f"Anchor to RECEIVE (compress): {post_cl}",
+            f"    Stretch-leading posts   : {post_sl}    "
+            f"Compression-leading posts: {post_cl}",
             f"      (how many posts are followed mainly by stretch vs compression)",
-            f"    Peak stretch (mean)     : {post_str:.3f} BH{_flag(post_str, 0.05, 0.15)}",
+            f"    Stretch range (mean)    : {post_str:.3f} BH{_flag(post_str, 0.05, 0.15)}",
             f"      — how far dancers moved apart after the post, in body heights",
-            f"    Peak compression (mean) : {post_cmp:.3f} BH",
+            f"    Compression range (mean): {post_cmp:.3f} BH",
             f"      — how much partners closed in after the post, in body heights",
         ]
     lines += [""]
