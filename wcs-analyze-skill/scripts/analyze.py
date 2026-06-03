@@ -234,6 +234,23 @@ def _dancer_on_side(poses: dict, side: str) -> int:
 
 # ── pro gap comparison ────────────────────────────────────────────────────────
 
+def _orient_lead_first(poses: dict) -> None:
+    """Swap tracked Dancer 1 <-> 2 in place so the actual LEAD becomes Dancer 1.
+
+    The tracker numbers the two dancers arbitrarily. Once we know which tracked dancer
+    is the lead (from --me/--me-id + --role), relabelling so the lead is Dancer 1 makes
+    every positional 'lead'/'follow' metric and report section reflect the TRUE roles
+    rather than tracker order. Keys are ints here (poses already normalised).
+    """
+    for f in poses.get("frames", []):
+        d = f.get("dancers")
+        if not d:
+            continue
+        f["dancers"] = {(2 if k == 1 else 1 if k == 2 else k): v for k, v in d.items()}
+    if poses.get("dancer_ids"):
+        poses["dancer_ids"] = sorted(int(i) for i in poses["dancer_ids"])
+
+
 def _load_pro_metrics(video_path: pathlib.Path, poses_path: pathlib.Path) -> dict | None:
     if not poses_path.exists():
         return None
@@ -251,18 +268,21 @@ def _cols_for(dancer_id: int) -> tuple:
 
 
 def _gap_report(am_metrics: dict, pro_entries: list, you_id: int = 1,
-                include_partner: bool = False, spotlight: bool = False) -> str:
+                include_partner: bool = False, spotlight: bool = False,
+                my_role: str = "lead") -> str:
     """Build a concise gap-comparison table (you vs pro average).
 
-    `you_id` is the tracked Dancer ID that is YOU (the lead) in this video. Role-
-    specific rows compare YOU against each pro's LEAD. When `include_partner` is set,
-    the same metrics are also shown for your PARTNER (the follow) vs each pro's FOLLOW
-    — i.e. a like-for-like analysis of the follower. Partnership rows are role-agnostic.
+    `you_id` is the tracked Dancer ID that is YOU in this video, and `my_role`
+    ("lead"/"follow") is the role you dance. Role-specific rows compare YOU against
+    each pro of the SAME role. When `include_partner` is set, the same metrics are
+    also shown for your PARTNER (the other role) vs each pro of that role — a
+    like-for-like analysis. Partnership rows are role-agnostic.
 
     pro_entries items are (label, metrics, lead_id) where lead_id is which Dancer ID
     is that pro's lead.
     """
 
+    partner_role             = "follow" if my_role == "lead" else "lead"
     you_side, you_ab         = _cols_for(you_id)
     partner_id               = 2 if you_id == 1 else 1
     partner_side, partner_ab = _cols_for(partner_id)
@@ -286,10 +306,12 @@ def _gap_report(am_metrics: dict, pro_entries: list, you_id: int = 1,
         return _dig(am_metrics, category, subkey, kind, side, ab)
 
     def _pro_avg(category, subkey, kind, role):
+        # Compare against the pro of the SAME role as whoever this row is about.
+        want_role = my_role if role == "you" else partner_role
         vals = []
         for _lbl, pm, lead_id in pro_entries:
             follow_id = 2 if lead_id == 1 else 1
-            target_id = lead_id if role == "you" else follow_id
+            target_id = lead_id if want_role == "lead" else follow_id
             p_side, p_ab = _cols_for(target_id)
             v = _dig(pm, category, subkey, kind, p_side, p_ab)
             if v is not None:
@@ -335,9 +357,10 @@ def _gap_report(am_metrics: dict, pro_entries: list, you_id: int = 1,
 
     roles = ["you", "partner"] if include_partner else ["you"]
 
-    header = f"  you = Dancer {you_id} (lead); rows compare you vs each pro's LEAD"
+    header = f"  you = Dancer {you_id} ({my_role}); rows compare you vs each pro's {my_role.upper()}"
     if include_partner:
-        header += "\n  partner = the follow; partner rows compare vs each pro's FOLLOW"
+        header += (f"\n  partner = the {partner_role}; partner rows compare vs each "
+                   f"pro's {partner_role.upper()}")
     lines = [
         "",
         "=" * 72,
@@ -360,7 +383,8 @@ def _gap_report(am_metrics: dict, pro_entries: list, you_id: int = 1,
 
     for role in roles:
         if include_partner:
-            lines.append(f"  -- {role.upper()} --")
+            disp = my_role if role == "you" else partner_role
+            lines.append(f"  -- {role.upper()} ({disp.upper()}) --")
         for label, category, subkey, kind, hib, fmt in role_checks:
             _emit(label, _am(category, subkey, kind, role), _pro_avg(category, subkey, kind, role),
                   hib, fmt, f" — {role}", role)
@@ -388,17 +412,22 @@ def main():
     parser.add_argument("--output-dir", default=None,
                         help="Directory for output files (default: same as video)")
     parser.add_argument("--me", choices=["left", "right"], default="left",
-                        help="Which side YOU (the lead) start on: left=Dancer 1, "
+                        help="Which side YOU start on: left=Dancer 1, "
                              "right=Dancer 2 (default left). Resolved to a Dancer ID from "
                              "the first clean frame. Controls which tracked dancer the "
-                             "'you' rows and report headers refer to.")
+                             "'you' rows and report headers refer to. Pair with --role to "
+                             "say whether you lead or follow.")
+    parser.add_argument("--role", choices=["lead", "follow"], default="lead",
+                        help="Your dance role (default lead). 'you' rows are compared "
+                             "against each pro of the SAME role; with --partner, your "
+                             "partner is compared against each pro of the other role.")
     parser.add_argument("--me-id", type=int, choices=[1, 2], default=None,
                         help="Directly set which tracked Dancer ID is you, overriding --me. "
                              "Use when auto side-detection picks the wrong dancer (entry-heavy "
                              "clips): view a labelled frame, then pass 1 or 2.")
     parser.add_argument("--partner", action="store_true",
-                        help="Also show the follower's comparison (your partner vs each pro's "
-                             "follow) in the gap analysis, not just the lead's.")
+                        help="Also show your PARTNER's comparison (partner vs each pro of "
+                             "the other role) in the gap analysis, not just your own.")
     parser.add_argument("--spotlight", action="store_true",
                         help="Mark this clip as a spotlight (full-floor showcase). When set, "
                              "couple-around-the-room travel is compared to the pro baseline "
@@ -423,13 +452,22 @@ def main():
     poses = _load_or_extract(video_path)
     poses["video_path"] = str(video_path)
 
-    # Resolve which tracked Dancer ID is the user (the lead).
+    # Resolve which tracked Dancer ID is the user (their role is set by --role).
     if args.me_id is not None:
         you_id = args.me_id
-        print(f"  You (lead) = Dancer {you_id} (set explicitly via --me-id)")
+        print(f"  You ({args.role}) = Dancer {you_id} (set explicitly via --me-id)")
     else:
         you_id = _dancer_on_side(poses, args.me)
-        print(f"  You (lead) start on the {args.me} → Dancer {you_id}")
+        print(f"  You ({args.role}) start on the {args.me} → Dancer {you_id}")
+
+    # Orient tracking so the actual LEAD is Dancer 1, making every positional
+    # 'lead'/'follow' metric and report section reflect true roles (not tracker order).
+    partner_tracked = 2 if you_id == 1 else 1
+    lead_tracked    = you_id if args.role == "lead" else partner_tracked
+    if lead_tracked != 1:
+        _orient_lead_first(poses)
+        print("  (Oriented tracking so the lead is Dancer 1 — metrics reflect true roles.)")
+    you_id = 1 if args.role == "lead" else 2
 
     # ── step 3: metrics ──────────────────────────────────────────────────────
     print("  Computing metrics …")
@@ -440,7 +478,7 @@ def main():
     print("  Building report …\n")
     report = dr.build_report(str(video_path), poses, metrics, you_id=you_id,
                              me=(None if args.me_id is not None else args.me),
-                             spotlight=args.spotlight)
+                             spotlight=args.spotlight, my_role=args.role)
 
     report_path = out_dir / (video_path.stem + "_report.txt")
     report_path.write_text(report, encoding="utf-8")
@@ -458,7 +496,8 @@ def main():
 
         if pro_entries:
             gap = _gap_report(metrics, pro_entries, you_id=you_id,
-                              include_partner=args.partner, spotlight=args.spotlight)
+                              include_partner=args.partner, spotlight=args.spotlight,
+                              my_role=args.role)
             print(gap)
             gap_path = out_dir / (video_path.stem + "_gap_analysis.txt")
             gap_path.write_text(gap, encoding="utf-8")

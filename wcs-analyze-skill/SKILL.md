@@ -56,12 +56,14 @@ The user will give either:
 
 If the input is ambiguous (e.g. "my latest video"), ask for the path or URL before proceeding.
 
-**Which dancer is the user?** The pipeline has no dance-role detection — it just
-tracks two people as Dancer 1 and Dancer 2 (identities are kept stable across the clip
-by an appearance/colour re-ID — see Key implementation details). The user dances
-**lead**, so to attribute the stats to them you must know which tracked dancer they are.
-**Ask the user "which side do you start on, left or right?"** and pass `--me left` /
-`--me right`; the script resolves the side to a Dancer ID from the first clean frame.
+**Which dancer is the user, and what role?** The pipeline has no dance-role detection —
+it just tracks two people as Dancer 1 and Dancer 2 (identities are kept stable across the
+clip by an appearance/colour re-ID — see Key implementation details). To attribute the
+stats you must know **which tracked dancer the user is** and **which role they dance**.
+**Ask "which side do you start on, left or right?"** and pass `--me left` / `--me right`;
+the script resolves the side to a Dancer ID from the first clean frame. **Also ask "do you
+lead or follow?"** and pass `--role lead` / `--role follow` (default `lead`) — this is what
+makes the gap analysis compare the user against the pros of their *own* role.
 **Verify it landed on the right dancer** — entry-heavy clips (walk-ons, the dancers far
 apart at the start) can fool the side resolver. If it's wrong, extract a clear frame,
 identify the user, and re-run with **`--me-id 1`** or **`--me-id 2`** to set the Dancer
@@ -70,22 +72,24 @@ ID directly (this overrides `--me`). Default is `--me left`.
 ### 2. Run the analysis script
 
 ```
-python wcs-analyze-skill/scripts/analyze.py "<input>" [--compare-pros] [--me left|right | --me-id 1|2] [--partner] [--spotlight]
+python wcs-analyze-skill/scripts/analyze.py "<input>" [--compare-pros] [--me left|right | --me-id 1|2] [--role lead|follow] [--partner] [--spotlight]
 ```
 
-- Pass `--me left` or `--me right` to say which side the user (the lead) starts on, or
+- Pass `--me left` or `--me right` to say which side the user starts on, or
   `--me-id 1|2` to name their Dancer ID directly (use when the side resolver picks the
-  wrong dancer). Either way the report header and gap analysis label that dancer
-  **"you"** and compare it against each **pro's lead** (the pro lead is configured per
-  clip by Dancer ID in `PRO_REFS`). Defaults to `--me left`.
+  wrong dancer). The report header and gap analysis label that dancer **"you"**.
+  Defaults to `--me left`.
+- Pass `--role lead` or `--role follow` (default `lead`) to set the user's role. The
+  "you" rows are then compared against each **pro of that same role** (pro leads are
+  configured per clip by `lead_id` in `pro_refs.json`; the pro follow is the other dancer).
 - Pass `--compare-pros` whenever the user wants to see how they stack up against
   the pros, or when it would be useful context (e.g. first-time analysis of an
   amateur video).
-- Pass `--partner` to also analyse the **follower** — it adds a `-- PARTNER --` block
-  to the gap analysis comparing the partner against each pro's *follow* (not lead). Use
-  this when the user wants their partner's analysis too. You can then bridge the
-  partner's gaps to notes the same way (the user's own notes are the lead's, so use the
-  universal/follow-oriented concepts and say so).
+- Pass `--partner` to also analyse the user's **partner** — it adds a `-- PARTNER --`
+  block to the gap analysis comparing the partner against each pro of the *other* role.
+  Use this when the user wants their partner's analysis too. You can then bridge the
+  partner's gaps to notes the same way (if the user's own lesson notes are from their
+  own perspective, use universal / other-role-oriented concepts for the partner and say so).
 - Pass `--spotlight` when the clip is a **full-floor spotlight/showcase** (the couple is
   meant to travel around the room). By default a clip is treated as **contained**
   (prelim/practice), where staying compact is expected — so the *Couple travel around

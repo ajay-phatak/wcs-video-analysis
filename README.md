@@ -103,12 +103,16 @@ python wcs-analyze-skill/scripts/analyze.py path/to/your_video.mp4 --compare-pro
 ```
 
 **Key flags:**
-- `--me left|right` — which side you (the lead) start on; resolved to a Dancer ID
-  from the first clean frame. Default: `left`.
+- `--me left|right` — which side you start on; resolved to a Dancer ID from the
+  first clean frame. Default: `left`.
+- `--role lead|follow` — the role you dance (default `lead`). Your stats are
+  compared against each pro of the **same** role, so a follower analysing their own
+  video is benchmarked against the pro follows, not the leads.
 - `--me-id 1|2` — override auto-detection and name your Dancer ID directly (use
   when entry-heavy clips fool the side resolver).
 - `--compare-pros` — print gap analysis vs your pro references.
-- `--partner` — also show the follower's comparison in the gap analysis.
+- `--partner` — also show your partner's comparison (vs each pro of the other role).
+- `--spotlight` — mark a full-floor showcase clip (otherwise treated as contained).
 - `--output-dir <dir>` — where to save reports (default: same directory as the video).
 
 Pose extraction is slow (~3–5 min for a 3-min video). Results are cached as

@@ -55,12 +55,23 @@ def _fmt_time(secs: float) -> str:
 # ---------------------------------------------------------------------------
 
 def _header(video_path: str, pose_data: dict, metrics: dict, lines: list,
-            you_id: int | None = None, me: str | None = None):
+            you_id: int | None = None, me: str | None = None,
+            my_role: str | None = None):
     fps    = pose_data["fps"]
     frames = pose_data["frame_count"]
     ids    = pose_data.get("dancer_ids", [])
     dur    = frames / fps if fps else 0
     cam    = metrics.get("camera_setup", {})
+
+    role_known = my_role in ("lead", "follow")
+    lead_d  = ids[0] if ids else "?"
+    follow_d = ids[1] if len(ids) > 1 else "?"
+    if role_known:
+        label_line = (f"  Roles     : Lead = Dancer {lead_d}, Follow = Dancer {follow_d}  "
+                      f"(oriented to --role — 'Lead'/'Follow' sections reflect true roles)")
+    else:
+        label_line = (f"  Section labels: 'Lead' = Dancer {lead_d}, 'Follow' = Dancer {follow_d}  "
+                      f"(tracker order — verify vs video)")
 
     lines += [
         SEP,
@@ -69,12 +80,16 @@ def _header(video_path: str, pose_data: dict, metrics: dict, lines: list,
         f"  Video     : {os.path.basename(video_path)}",
         f"  Duration  : {_fmt_time(dur)}  ({frames} frames @ {fps:.1f} fps)",
         f"  Dancers   : {len(ids)} tracked  (IDs: {ids})",
-        f"  Lead ID   : {ids[0] if ids else '?'}    Follow ID: {ids[1] if len(ids) > 1 else '?'}",
+        label_line,
     ]
     if you_id in (1, 2):
         col = "lead" if you_id == 1 else "follow"
         side_txt = f", started on the {me}" if me in ("left", "right") else ""
-        lines.append(f"  You (lead): Dancer {you_id} (the '{col}' column below{side_txt})")
+        role_txt = f", the {my_role}" if role_known else ""
+        lines.append(
+            f"  You: Dancer {you_id}{role_txt} "
+            f"(your stats are the '{col}' sections below{side_txt})"
+        )
     lines.append("")
 
     tq = metrics.get("tracking_quality", {})
@@ -575,10 +590,10 @@ def _movement_detail_section(metrics: dict, lines: list):
 
 def build_report(video_path: str, pose_data: dict, metrics: dict,
                  you_id: int | None = None, me: str | None = None,
-                 spotlight: bool = False) -> str:
+                 spotlight: bool = False, my_role: str | None = None) -> str:
     lines = []
 
-    _header(video_path, pose_data, metrics, lines, you_id=you_id, me=me)
+    _header(video_path, pose_data, metrics, lines, you_id=you_id, me=me, my_role=my_role)
 
     clip_type = "spotlight (full-floor)" if spotlight else "contained (prelim/practice)"
     lines += [f"  Clip type               : {clip_type}", ""]
