@@ -156,7 +156,14 @@ def extract_audio_features(video_path: str) -> dict:
         song_dynamic_range float      RMS spread (p90−p10)/mean — accent dynamics
         accent_count      int
     """
-    TEXTURE_HOP_S = 0.5   # window for the bouncy↔smooth texture series
+    TEXTURE_HOP_S  = 0.5     # window for the bouncy↔smooth texture series
+    TEMPO_MIN_BPM  = 65.0    # WCS-plausible tempo band. beat_track's dynamic-programming
+    TEMPO_MAX_BPM  = 120.0   # tempo octave-jumps on syncopated songs (e.g. 172 or 48 for a
+                             # true ~95), so we take the onset-autocorrelation peak inside
+                             # this band, weighted by a prior, instead.
+    TEMPO_PRIOR_BPM = 94.0   # centre of the log-normal tempo prior (typical WCS tempo).
+    TEMPO_PRIOR_OCT = 0.4    # prior width in octaves — disambiguates harmonic peaks
+                             # (e.g. 66 vs 95) without hard-excluding valid slow/fast tempos.
 
     audio_path = Path(tempfile.mktemp(suffix=".wav"))
     ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
@@ -171,10 +178,37 @@ def extract_audio_features(video_path: str) -> dict:
         y, sr = librosa.load(str(audio_path), sr=22050)
 
         # ── beats / tempo ──────────────────────────────────────────────────
-        tempo, beat_frames = librosa.beat.beat_track(y=y, sr=sr, units="frames")
-        beat_times = librosa.frames_to_time(beat_frames, sr=sr)
-        tempo_val  = float(np.atleast_1d(tempo)[0])
-        beat_dur   = 60.0 / max(tempo_val, 60.0)
+        # beat_track's dynamic-programming tempo estimate octave-jumps on
+        # syncopated / WCS songs (e.g. reads 172 or 48 for a true ~95). Take the
+        # strongest periodicity of the onset envelope within a WCS-plausible BPM
+        # band instead, then force the beat grid to that tempo.
+        dur_s     = len(y) / sr if sr else 0.0
+        tempo_hop = 512
+        oenv_t    = librosa.onset.onset_strength(y=y, sr=sr, hop_length=tempo_hop)
+        ac        = librosa.autocorrelate(oenv_t)
+        tfreq     = librosa.tempo_frequencies(len(ac), sr=sr, hop_length=tempo_hop)
+        band      = (tfreq >= TEMPO_MIN_BPM) & (tfreq <= TEMPO_MAX_BPM)
+        if band.any() and float(np.max(ac[band])) > 0:
+            # Weight the in-band autocorrelation by a log-normal prior centred on a
+            # typical WCS tempo to disambiguate harmonic peaks (e.g. 66 vs 95 vs 172),
+            # which sit within a few % of each other in the raw autocorrelation.
+            prior = np.exp(-0.5 * ((np.log2(np.maximum(tfreq, 1e-6)) -
+                                    np.log2(TEMPO_PRIOR_BPM)) / TEMPO_PRIOR_OCT) ** 2)
+            score = np.where(band, ac * prior, -np.inf)
+            tempo_val = float(tfreq[int(np.argmax(score))])
+        else:
+            _t, _ = librosa.beat.beat_track(y=y, sr=sr, units="frames")
+            tempo_val = float(np.atleast_1d(_t)[0])
+
+        # Beat grid forced to the resolved tempo (phase-aligned to onsets); fall
+        # back to a uniform grid if this librosa lacks the bpm= override.
+        try:
+            _, beat_frames = librosa.beat.beat_track(
+                y=y, sr=sr, bpm=tempo_val, units="frames")
+            beat_times = librosa.frames_to_time(beat_frames, sr=sr)
+        except TypeError:
+            beat_times = np.arange(0.0, dur_s, 60.0 / max(tempo_val, 1e-6))
+        beat_dur  = 60.0 / max(tempo_val, 60.0)
 
         # ── RMS energy envelope (100 ms) ───────────────────────────────────
         rms_hop  = int(sr * 0.1)
