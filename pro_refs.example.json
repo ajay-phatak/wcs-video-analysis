@@ -1,14 +1,23 @@
 [
   {
-    "video":   "pros/couple_a/pro_reference.mp4",
-    "poses":   "pros/couple_a/pro_reference_poses.json",
-    "label":   "Pro A (86 BPM)",
+    "video":   "pros/couple_a/clip_one.mp4",
+    "poses":   "pros/couple_a/clip_one_poses.json",
+    "label":   "Couple A — Clip One (86 BPM)",
+    "couple":  "Couple A",
     "lead_id": 2
   },
   {
-    "video":   "pros/couple_b/pro_reference.mp4",
-    "poses":   "pros/couple_b/pro_reference_poses.json",
-    "label":   "Pro B (103 BPM)",
+    "video":   "pros/couple_a/clip_two.mp4",
+    "poses":   "pros/couple_a/clip_two_poses.json",
+    "label":   "Couple A — Clip Two (99 BPM)",
+    "couple":  "Couple A",
+    "lead_id": 1
+  },
+  {
+    "video":   "pros/couple_b/clip.mp4",
+    "poses":   "pros/couple_b/clip_poses.json",
+    "label":   "Couple B (103 BPM)",
+    "couple":  "Couple B",
     "lead_id": 1
   }
 ]

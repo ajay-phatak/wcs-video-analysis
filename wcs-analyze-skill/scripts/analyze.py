@@ -32,18 +32,23 @@ import dance_review as dr
 import pose_extraction as pe
 
 # ── pro reference configuration ──────────────────────────────────────────────
-# Pro reference entries: (video_path, poses_json_path, display_label, lead_id)
+# Pro reference entries: (video_path, poses_json_path, display_label, lead_id, couple)
 # lead_id = which tracked Dancer ID (1 or 2) is the pro LEAD in that clip.
-# NOTE: Dancer IDs are re-assigned on every extraction — re-verify lead_id whenever
-# pro poses are regenerated (identify the lead from a clear open-position frame; see
-# "Adding a new pro reference video" in SKILL.md).
+# couple  = which couple this clip belongs to. The gap analysis groups clips by
+#           couple, averages each couple's clips together, and shows a SEPARATE gap
+#           section per couple (rather than one pooled pro average). Use the same
+#           `couple` string across a couple's clips to pool them.
+# NOTE: Dancer IDs are re-assigned on every extraction, and lead_id is PER CLIP (the
+# same pro can be Dancer 1 in one clip and Dancer 2 in another). Re-verify whenever
+# pro poses are regenerated (identify the lead from a clear MID-PERFORMANCE frame —
+# the first frames are often an intro/title card; see SKILL.md).
 #
 # Configuration priority:
-#   1. pro_refs.json in DANCE_DIR  — explicit list [{video, poses, label, lead_id}]
-#   2. Auto-discover pros/*/       — first video + matching *_poses.json per subfolder
-#      (lead_id defaults to 1; a reminder is printed to verify this)
+#   1. pro_refs.json in DANCE_DIR  — explicit list [{video, poses, label, lead_id, couple}]
+#   2. Auto-discover pros/*/       — each subfolder = one couple, ALL its clips with a
+#      matching *_poses.json (lead_id defaults to 1; a reminder is printed to verify)
 #
-# Create a pro_refs.json from the provided pro_refs.example.json to set lead_id correctly.
+# Create a pro_refs.json from the provided pro_refs.example.json to set these correctly.
 
 def _load_pro_refs(dance_dir: pathlib.Path) -> list:
     """Return a list of (video_path, poses_path, label, lead_id) tuples."""
@@ -58,7 +63,8 @@ def _load_pro_refs(dance_dir: pathlib.Path) -> list:
                 vp = dance_dir / vp
             if not pp.is_absolute():
                 pp = dance_dir / pp
-            result.append((vp, pp, e["label"], int(e.get("lead_id", 1))))
+            result.append((vp, pp, e["label"], int(e.get("lead_id", 1)),
+                           e.get("couple", e["label"])))
         return result
 
     # Auto-discover pros/*/
@@ -71,15 +77,17 @@ def _load_pro_refs(dance_dir: pathlib.Path) -> list:
             videos = sorted(sub.glob("*.mp4")) + sorted(sub.glob("*.mov")) + sorted(sub.glob("*.MOV"))
             if not videos:
                 continue
-            vp = videos[0]
-            pp_candidates = sorted(sub.glob(f"{vp.stem}_poses.json"))
-            if not pp_candidates:
-                continue
-            pp = pp_candidates[0]
-            label = sub.name
-            print(f"  [pro-refs] Auto-discovered: {label} — lead_id defaulting to 1. "
-                  "Create pro_refs.json to set the correct lead_id.")
-            result.append((vp, pp, label, 1))
+            couple = sub.name           # one folder = one couple; all its clips group together
+            found = False
+            for vp in videos:
+                pp_candidates = sorted(sub.glob(f"{vp.stem}_poses.json"))
+                if not pp_candidates:
+                    continue
+                found = True
+                result.append((vp, pp_candidates[0], vp.stem, 1, couple))
+            if found:
+                print(f"  [pro-refs] Auto-discovered couple '{couple}' — lead_id defaulting to 1 "
+                      "for its clips. Create pro_refs.json to set the correct per-clip lead_id.")
     return result
 
 
@@ -270,16 +278,17 @@ def _cols_for(dancer_id: int) -> tuple:
 def _gap_report(am_metrics: dict, pro_entries: list, you_id: int = 1,
                 include_partner: bool = False, spotlight: bool = False,
                 my_role: str = "lead") -> str:
-    """Build a concise gap-comparison table (you vs pro average).
+    """Build a concise gap-comparison table, broken out PER COUPLE.
 
     `you_id` is the tracked Dancer ID that is YOU in this video, and `my_role`
-    ("lead"/"follow") is the role you dance. Role-specific rows compare YOU against
-    each pro of the SAME role. When `include_partner` is set, the same metrics are
-    also shown for your PARTNER (the other role) vs each pro of that role — a
-    like-for-like analysis. Partnership rows are role-agnostic.
+    ("lead"/"follow") is the role you dance. Clips are grouped by couple; each couple
+    gets its own section with its clips averaged together. Role-specific rows compare
+    YOU against that couple's dancer of the SAME role. When `include_partner` is set,
+    the same metrics are also shown for your PARTNER (the other role) vs that couple's
+    other-role dancer. Partnership rows are role-agnostic.
 
-    pro_entries items are (label, metrics, lead_id) where lead_id is which Dancer ID
-    is that pro's lead.
+    pro_entries items are (label, metrics, lead_id, couple) where lead_id is which
+    Dancer ID is that clip's lead and couple is the grouping key.
     """
 
     partner_role             = "follow" if my_role == "lead" else "lead"
@@ -305,11 +314,12 @@ def _gap_report(am_metrics: dict, pro_entries: list, you_id: int = 1,
         ab   = you_ab   if role == "you" else partner_ab
         return _dig(am_metrics, category, subkey, kind, side, ab)
 
-    def _pro_avg(category, subkey, kind, role):
-        # Compare against the pro of the SAME role as whoever this row is about.
+    def _pro_avg(entries, category, subkey, kind, role):
+        # Average one couple's clips, comparing against the pro of the SAME role as
+        # whoever this row is about. `entries` are this couple's (label, metrics, lead_id).
         want_role = my_role if role == "you" else partner_role
         vals = []
-        for _lbl, pm, lead_id in pro_entries:
+        for _lbl, pm, lead_id in entries:
             follow_id = 2 if lead_id == 1 else 1
             target_id = lead_id if want_role == "lead" else follow_id
             p_side, p_ab = _cols_for(target_id)
@@ -357,15 +367,20 @@ def _gap_report(am_metrics: dict, pro_entries: list, you_id: int = 1,
 
     roles = ["you", "partner"] if include_partner else ["you"]
 
-    header = f"  you = Dancer {you_id} ({my_role}); rows compare you vs each pro's {my_role.upper()}"
+    # Group clips by couple (insertion order preserved), so each couple gets its own
+    # section with its clips averaged together — rather than one pooled pro average.
+    groups = {}
+    for lbl, pm, lead_id, couple in pro_entries:
+        groups.setdefault(couple, []).append((lbl, pm, lead_id))
+
+    header = f"  you = Dancer {you_id} ({my_role}); rows compare you vs each couple's {my_role.upper()}"
     if include_partner:
         header += (f"\n  partner = the {partner_role}; partner rows compare vs each "
-                   f"pro's {partner_role.upper()}")
+                   f"couple's {partner_role.upper()}")
     lines = [
         "",
         "=" * 72,
-        "  GAP ANALYSIS vs PRO REFERENCE",
-        f"  (averaging over: {', '.join(lbl for lbl, _pm, _lid in pro_entries)})",
+        "  GAP ANALYSIS vs PRO REFERENCES  (broken out per couple)",
         header,
         "=" * 72,
     ]
@@ -381,22 +396,33 @@ def _gap_report(am_metrics: dict, pro_entries: list, you_id: int = 1,
             f"{arrow} {sign}{delta:{fmt}}{note}"
         )
 
-    for role in roles:
-        if include_partner:
-            disp = my_role if role == "you" else partner_role
-            lines.append(f"  -- {role.upper()} ({disp.upper()}) --")
-        for label, category, subkey, kind, hib, fmt in role_checks:
-            _emit(label, _am(category, subkey, kind, role), _pro_avg(category, subkey, kind, role),
-                  hib, fmt, f" — {role}", role)
+    for couple, entries in groups.items():
+        clips = ", ".join(lbl for lbl, _pm, _lid in entries)
+        n = len(entries)
+        lines += [
+            "",
+            "-" * 72,
+            f"  vs {couple}  —  averaged over {n} clip{'s' if n != 1 else ''}: {clips}",
+            "-" * 72,
+        ]
+        for role in roles:
+            if include_partner:
+                disp = my_role if role == "you" else partner_role
+                lines.append(f"  -- {role.upper()} ({disp.upper()}) --")
+            for label, category, subkey, kind, hib, fmt in role_checks:
+                _emit(label, _am(category, subkey, kind, role),
+                      _pro_avg(entries, category, subkey, kind, role),
+                      hib, fmt, f" — {role}", role)
 
-    if include_partner:
-        lines.append("  -- PARTNERSHIP (both) --")
-    for label, category, subkey, hib, fmt in pair_checks:
-        note = ""
-        if subkey == "couple_travel_range_bh" and not spotlight:
-            note = "   (not spotlight — lower expected)"
-        _emit(label, _am(category, subkey, "pair", "you"), _pro_avg(category, subkey, "pair", "you"),
-              hib, fmt, "", "you", note=note)
+        if include_partner:
+            lines.append("  -- PARTNERSHIP (both) --")
+        for label, category, subkey, hib, fmt in pair_checks:
+            note = ""
+            if subkey == "couple_travel_range_bh" and not spotlight:
+                note = "   (not spotlight — lower expected)"
+            _emit(label, _am(category, subkey, "pair", "you"),
+                  _pro_avg(entries, category, subkey, "pair", "you"),
+                  hib, fmt, "", "you", note=note)
 
     lines += ["", "=" * 72]
     return "\n".join(lines)
@@ -489,10 +515,11 @@ def main():
     if args.compare_pros:
         pro_entries = []
         for vp, pp, lbl, *rest in PRO_REFS:
-            lead_id = rest[0] if rest else 1
+            lead_id = rest[0] if len(rest) > 0 else 1
+            couple  = rest[1] if len(rest) > 1 else lbl
             pm = _load_pro_metrics(vp, pp)
             if pm:
-                pro_entries.append((lbl, pm, lead_id))
+                pro_entries.append((lbl, pm, lead_id, couple))
 
         if pro_entries:
             gap = _gap_report(metrics, pro_entries, you_id=you_id,

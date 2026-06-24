@@ -68,21 +68,30 @@ starting point):
 ```json
 [
   {
-    "video":   "pros/couple_a/clip.mp4",
-    "poses":   "pros/couple_a/clip_poses.json",
-    "label":   "Pro A (86 BPM)",
+    "video":   "pros/couple_a/clip_one.mp4",
+    "poses":   "pros/couple_a/clip_one_poses.json",
+    "label":   "Couple A — Clip One (86 BPM)",
+    "couple":  "Couple A",
     "lead_id": 2
   }
 ]
 ```
 
 `lead_id` is which tracked Dancer ID (1 or 2) is the pro **lead** in that clip.
-Dancer IDs are re-assigned on every extraction, so identify the lead from a clear
-open-position frame and verify after each re-extraction.
+Dancer IDs are re-assigned on every extraction **and are per-clip** — the same pro
+can be Dancer 1 in one clip and Dancer 2 in another — so identify the lead from a
+clear **mid-performance** frame (the first frames are often an intro/title card where
+the tracker boxes the audience) and verify after each re-extraction.
 
-If `pro_refs.json` is absent, the script auto-discovers `pros/*/` subfolders
-(first video + its matching `*_poses.json` per folder) and defaults `lead_id` to 1
-with a printed reminder to verify.
+`couple` is a grouping key. The gap analysis groups clips by `couple`, averages each
+couple's clips together, and prints a **separate gap section per couple** instead of
+one pooled average — so you can benchmark yourself against specific couples you want
+to emulate, and add multiple clips of a couple to firm up their reference. Use the
+same `couple` string across that couple's clips.
+
+If `pro_refs.json` is absent, the script auto-discovers `pros/*/` subfolders — each
+subfolder is treated as one couple and **all** its clips with a matching
+`*_poses.json` are used, with `lead_id` defaulting to 1 and a printed reminder to verify.
 
 ---
 

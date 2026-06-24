@@ -267,21 +267,31 @@ gap or a *ceiling* gap, and whether the dynamic movement is *landing on the musi
 
 When the user wants to add another pro video to expand the benchmark:
 
-1. Run `analyze.py` on the new URL/file — poses are cached automatically.
+1. Run `analyze.py` on the new URL/file — poses are cached automatically as
+   `<stem>_poses.json` next to the clip.
 2. **Identify which tracked dancer is the pro lead.** Don't guess from side — the
-   tracker's Dancer 1 is not reliably the left dancer. Extract a clear frame (dancers
-   close to camera, both detected) and look at who is leading, or ask the user. Then
-   add the entry to `PRO_REFS` in `scripts/analyze.py` with that lead **Dancer ID**
-   (`1` or `2`) as the 4th element:
-   Add an entry to `pro_refs.json` (see `pro_refs.example.json` for the format):
+   tracker's Dancer 1 is not reliably the left dancer, and `lead_id` is **per clip**
+   (the same pro can be Dancer 1 in one clip and Dancer 2 in another). Render a clear
+   **mid-performance** frame, NOT the first frame: pro clips often open on a blurred
+   intro/title card where the tracker boxes the audience. Pick a frame where both
+   dancers' bounding boxes are large (≈70%+ of image height = the performers on the
+   floor), label each tracked Dancer ID on it, and have the user confirm which ID is
+   the lead.
+3. Add an entry to `pro_refs.json` (see `pro_refs.example.json` for the format):
    ```json
    {"video": "pros/new_pro/clip.mp4", "poses": "pros/new_pro/clip_poses.json",
-    "label": "Pro N (BPM)", "lead_id": 2}
+    "label": "Couple N — Event (BPM)", "couple": "Couple N", "lead_id": 2}
    ```
-   Paths are relative to the project root (or absolute). The user's lead stats are
-   compared against this dancer; partnership metrics (posts, distance variance,
-   counter-balance) are role-agnostic and unaffected.
-3. Confirm with the user that the entry is added.
+   Paths are relative to the project root (or absolute). `couple` groups clips: the
+   gap analysis averages each couple's clips and prints a **separate section per
+   couple**, so use the same `couple` string across that couple's clips. The user's
+   lead stats are compared against that couple's lead; partnership metrics (posts,
+   distance variance, counter-balance) are role-agnostic and unaffected.
+4. **Caveat on long clips:** full-song performances (3–5 min) accumulate tracker
+   identity swaps, which inflate the per-dancer timing-consistency and post-count
+   numbers. Trust the body-mechanics rows from such clips; lean on shorter,
+   cleanly-tracked clips for timing/post comparisons.
+5. Confirm with the user that the entry is added.
 
 ---
 
