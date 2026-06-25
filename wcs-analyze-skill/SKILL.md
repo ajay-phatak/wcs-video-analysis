@@ -98,8 +98,33 @@ python wcs-analyze-skill/scripts/analyze.py "<input>" [--compare-pros] [--me lef
   **Ask the user whether the clip is a spotlight** before running with `--compare-pros`,
   since pro references are typically spotlights and the couple-travel comparison is only
   apples-to-apples for another spotlight.
+- Pass `--pose-model n|s|m|l|x` to choose the YOLOv8-pose model (default `m`). Use `l`/`x`
+  for max accuracy on small or crowded figures (slower; poses are cached once). The model
+  name is recorded in the poses JSON, and a mismatch with a cached file is reported.
 - The script handles downloading, pose extraction caching, metric computation,
   and report generation automatically.
+
+#### Crowded footage — seed the user's couple
+
+The default tracker assumes the only two people on screen are the couple, so it fails on
+crowded floors (prelim heats, socials) where it can't tell which two detections are the
+user. If the clip has other couples/people moving, use **crowd mode** instead of `--me`:
+
+1. **Preview:** `analyze.py "<input>" --seed-frame <seconds>` — renders a numbered preview
+   `<stem>_seed.png` of everyone detected at that timestamp and exits. Pick a timestamp
+   where the user and partner are both clearly visible.
+2. **Show the user the preview** and ask which number is them and which is their partner.
+3. **Re-extract:** `analyze.py "<input>" --seed-me-idx <n> --seed-partner-idx <n> [--compare-pros --partner]`
+   — tracks only that couple out of the crowd (matches every frame against appearance +
+   motion anchors built from the two seeded people; ignores other couples; leaves a dancer
+   *missing* rather than swapping to a stranger when occluded). Seeding pins **dancer 1 =
+   the user, dancer 2 = partner**, so `--me`/`--me-id` are not needed.
+
+To pick the right numbers from the preview, the foreground couple is usually the largest,
+most-confident, front-most boxes; background couples and mirror reflections are smaller or
+off to the side. **Caveat:** seeding fixes *identity*, not *resolution* — if the couple
+fills little of the frame (distant phone footage), the fine per-dancer joint/articulation
+metrics stay approximate, so lead with the partnership and rhythm metrics for such clips.
 - Pose extraction is slow (~3–5 min for a 3-min video at 25-60 fps). The script
   caches results as `<stem>_poses.json` next to the video so subsequent runs are
   instant. Let the user know if extraction is running.

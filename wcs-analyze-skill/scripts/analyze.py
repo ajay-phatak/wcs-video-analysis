@@ -125,20 +125,74 @@ def _poses_path_for(video_path: pathlib.Path) -> pathlib.Path:
     return video_path.with_name(video_path.stem + "_poses.json")
 
 
-def _load_or_extract(video_path: pathlib.Path) -> dict:
-    """Load cached poses if available, otherwise run extraction (slow)."""
+def _load_or_extract(video_path: pathlib.Path, model_name: str = "yolov8m-pose.pt",
+                     seed: dict | None = None) -> dict:
+    """Load cached poses if available, otherwise run extraction (slow).
+
+    `seed` (crowd mode) = {"frame_idx": int, "points": [(x,y), (x,y)]} → always
+    re-extracts with the seeded matcher and overwrites the cache.
+    """
     poses_path = _poses_path_for(video_path)
-    if poses_path.exists():
+    if seed is None and poses_path.exists():
         print(f"  Loading cached poses from {poses_path.name} …")
         poses = json.loads(poses_path.read_text(encoding="utf-8"))
+        cached_model = poses.get("model")
+        if cached_model and cached_model != model_name:
+            print(f"  NOTE: cached poses were extracted with '{cached_model}', not "
+                  f"'{model_name}'. Delete {poses_path.name} to re-extract.")
     else:
-        print(f"  Running pose extraction on {video_path.name} …")
+        why = "seeded re-extraction" if seed is not None else "pose extraction"
+        print(f"  Running {why} on {video_path.name} with {model_name} …")
         print("  (this takes a few minutes — result cached as "
               f"{poses_path.name} for next time)")
-        poses = pe.extract_poses(str(video_path))
+        poses = pe.extract_poses(
+            str(video_path), model_name=model_name,
+            seed_frame_idx=(seed or {}).get("frame_idx"),
+            seed_points=(seed or {}).get("points"),
+        )
         poses_path.write_text(json.dumps(poses, default=str), encoding="utf-8")
         print(f"  Poses saved → {poses_path.name}")
     return _normalise_poses(poses)
+
+
+def _seed_preview(video_path: pathlib.Path, t_sec: float, model_name: str):
+    """Crowd mode step 1: detect everyone in one frame, save a numbered preview image
+    and a sidecar JSON of detection centres, so the user can point out the couple."""
+    import cv2
+    frame_idx, img, dets = pe.detect_single_frame(str(video_path), t_sec, model_name=model_name)
+    seed_json = {"frame_idx": int(frame_idx), "t_sec": float(t_sec), "dets": []}
+    for k, d in enumerate(dets):
+        x0, y0, x1, y1 = (int(v) for v in d["box"])
+        col = (0, 200, 255)
+        cv2.rectangle(img, (x0, y0), (x1, y1), col, 3)
+        cv2.rectangle(img, (x0, max(0, y0 - 36)), (x0 + 96, max(0, y0 - 36) + 36), col, -1)
+        cv2.putText(img, f"#{k}", (x0 + 6, max(0, y0 - 36) + 28),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.95, (0, 0, 0), 2)
+        seed_json["dets"].append({"idx": k,
+                                  "center": [float(d["center"][0]), float(d["center"][1])],
+                                  "conf": round(float(d["conf"]), 3)})
+    png = video_path.with_name(video_path.stem + "_seed.png")
+    js  = video_path.with_name(video_path.stem + "_seed.json")
+    cv2.imwrite(str(png), img)
+    js.write_text(json.dumps(seed_json, indent=2), encoding="utf-8")
+    print(f"  Seed preview → {png.name}  ({len(dets)} people detected at {t_sec:.1f}s)")
+    for d in seed_json["dets"]:
+        print(f"    #{d['idx']}: center=({d['center'][0]:.0f},{d['center'][1]:.0f})  conf={d['conf']}")
+    print("  Then re-run with: --seed-me-idx <n> --seed-partner-idx <n>")
+
+
+def _load_seed(video_path: pathlib.Path, me_idx: int, partner_idx: int) -> dict:
+    """Crowd mode step 2: read the seed sidecar and build the seed for extraction
+    (dancer 1 = you, dancer 2 = partner)."""
+    js = video_path.with_name(video_path.stem + "_seed.json")
+    if not js.exists():
+        sys.exit("ERROR: no seed preview found — run with --seed-frame <seconds> first.")
+    sj = json.loads(js.read_text(encoding="utf-8"))
+    by_idx = {d["idx"]: d["center"] for d in sj["dets"]}
+    if me_idx not in by_idx or partner_idx not in by_idx:
+        sys.exit(f"ERROR: seed indices not found; available: {sorted(by_idx)}")
+    return {"frame_idx": sj["frame_idx"],
+            "points": [tuple(by_idx[me_idx]), tuple(by_idx[partner_idx])]}
 
 
 def _download_youtube(url: str, out_dir: pathlib.Path) -> pathlib.Path:
@@ -459,6 +513,19 @@ def main():
                              "couple-around-the-room travel is compared to the pro baseline "
                              "normally. Otherwise the clip is treated as contained (prelim/"
                              "practice) and that one gap row is annotated 'lower expected'.")
+    parser.add_argument("--pose-model", default="yolov8m-pose.pt",
+                        help="YOLOv8 pose model for extraction (n/s/m/l/x; default m). "
+                             "Use l or x for max accuracy on small or crowded figures "
+                             "(slower; poses are cached once).")
+    parser.add_argument("--seed-frame", type=float, default=None,
+                        help="CROWD MODE step 1: seconds into the video to grab a frame; "
+                             "saves a numbered preview (<stem>_seed.png) of everyone detected, "
+                             "then exits so you can pick your couple.")
+    parser.add_argument("--seed-me-idx", type=int, default=None,
+                        help="CROWD MODE step 2: the preview number (#) that is YOU.")
+    parser.add_argument("--seed-partner-idx", type=int, default=None,
+                        help="CROWD MODE step 2: the preview number (#) that is your PARTNER. "
+                             "Re-extracts tracking only your couple out of the crowd.")
     args = parser.parse_args()
 
     # ── step 1: resolve input to a local video file ──────────────────────────
@@ -473,13 +540,25 @@ def main():
 
     out_dir = pathlib.Path(args.output_dir) if args.output_dir else video_path.parent
 
+    # ── crowd mode: seed the target couple ───────────────────────────────────
+    seeded = args.seed_me_idx is not None and args.seed_partner_idx is not None
+    if args.seed_frame is not None and not seeded:
+        # Step 1: render the numbered preview and exit so the user can pick.
+        print(f"\nSeeding: {video_path.name}")
+        _seed_preview(video_path, args.seed_frame, args.pose_model)
+        return
+    seed = _load_seed(video_path, args.seed_me_idx, args.seed_partner_idx) if seeded else None
+
     # ── step 2: pose extraction (cached) ────────────────────────────────────
     print(f"\nAnalysing: {video_path.name}")
-    poses = _load_or_extract(video_path)
+    poses = _load_or_extract(video_path, model_name=args.pose_model, seed=seed)
     poses["video_path"] = str(video_path)
 
     # Resolve which tracked Dancer ID is the user (their role is set by --role).
-    if args.me_id is not None:
+    if seeded:
+        you_id = 1   # seed step 2 pins dancer 1 = you, dancer 2 = partner
+        print(f"  You ({args.role}) = Dancer 1 (seeded as the person you picked, #{args.seed_me_idx})")
+    elif args.me_id is not None:
         you_id = args.me_id
         print(f"  You ({args.role}) = Dancer {you_id} (set explicitly via --me-id)")
     else:

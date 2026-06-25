@@ -45,6 +45,18 @@ KP = {
 CONF_THRESHOLD = 0.3
 MAX_DANCERS = 2
 
+# Crowd handling: keep up to MAX_KEEP detections per frame before identity matching
+# (was hard-capped at the top-2 by confidence, which discarded the target couple in a
+# crowded room before appearance matching could even run). With a seed, every frame's
+# detections are matched against the two seeded anchors instead of assuming top-2 = couple.
+MAX_KEEP = 12
+# Max Bhattacharyya colour distance to accept a detection as a seeded dancer (lower =
+# stricter). Beyond this the detection is "not this person" → dancer left missing.
+APP_GATE = 0.55
+# When a detection has no colour signature, accept it as a seeded dancer only if within
+# this many body-heights of that dancer's last known position (motion continuity).
+SPATIAL_GATE = 1.75
+
 # Appearance re-ID parameters — keep each dancer's ID locked to the same person
 # through slot crossings, where nearest-neighbour position alone is ambiguous.
 APP_WEIGHT = 2.0          # weight of colour distance vs body-height-normalised spatial distance
@@ -91,21 +103,31 @@ def _app_dist(a, b) -> float:
 
 
 def extract_poses(video_path: str, conf: float = CONF_THRESHOLD, frame_skip: int = 1,
-                  model_name: str = "yolov8n-pose.pt") -> dict:
+                  model_name: str = "yolov8m-pose.pt",
+                  seed_frame_idx: int | None = None,
+                  seed_points: list | None = None) -> dict:
     """
-    Detect all people per frame with YOLOv8-pose, then assign the top-2
-    detections to dancer 1 / dancer 2 using greedy nearest-neighbour
-    assignment from each frame to the next.
+    Detect people per frame with YOLOv8-pose and assign two of them to dancer 1 /
+    dancer 2 using a frozen-appearance + spatial-continuity cost.
 
-    This completely bypasses ByteTrack IDs, which fragment into hundreds of
-    short-lived segments when people occlude each other.  Because we know
-    there are exactly 2 dancers, per-frame 2×2 assignment gives near-100%
-    coverage whenever both are visible.
+    Two identity modes:
+      • Unseeded (default, clean 2-person footage): keep the top-2 detections per
+        frame and split them into two colour anchors built from "clean" frames. Good
+        when the only two people on screen are the couple.
+      • Seeded (`seed_points`, for crowded footage): keep ALL detections (up to
+        MAX_KEEP) and match every frame against two anchors built from the two people
+        the caller pointed at in `seed_frame_idx`. Detections that match neither
+        anchor (other couples) are ignored; when the target is occluded the dancer is
+        left MISSING for that frame rather than grabbing a stranger. `seed_points` is
+        [(x1, y1), (x2, y2)] in original-frame pixels → dancer 1, dancer 2 respectively.
 
-    Dancer labelling: in the first 2-person frame, dancer 1 is the person
-    whose hip centre has the smaller X coordinate (left in frame).
+    ByteTrack IDs are bypassed either way (they fragment under occlusion).
+    Dancer labelling (unseeded): in the first 2-person frame, dancer 1 is the person
+    whose hip centre has the smaller X coordinate (left in frame). Seeded: dancer 1 is
+    the first seed point.
     """
     model = YOLO(model_name)
+    seeded = bool(seed_points) and len(seed_points) == 2
 
     cap = cv2.VideoCapture(video_path)
     fps   = cap.get(cv2.CAP_PROP_FPS) or 30.0
@@ -130,24 +152,28 @@ def extract_poses(video_path: str, conf: float = CONF_THRESHOLD, frame_skip: int
             kps_all = result.keypoints.data.cpu().numpy()
             scores  = result.boxes.conf.cpu().numpy()
             img     = result.orig_img        # original BGR frame for colour sampling
-            # Sort detections by confidence descending so we pick the
-            # two most confident when more than 2 people are detected
+            # Sort detections by confidence descending. Keep up to MAX_KEEP so a
+            # seeded couple in a crowd survives into identity matching (unseeded mode
+            # still uses only the top-2 in Pass 2).
             order = np.argsort(scores)[::-1]
-            for i in order[:MAX_DANCERS]:
+            for i in order[:MAX_KEEP]:
                 kps = kps_all[i]
                 dets.append({"kps": kps, "center": _hip_center(kps),
-                             "sig": _torso_sig(img, kps)})
+                             "sig": _torso_sig(img, kps), "score": float(scores[i])})
         raw_frames.append({"frame_idx": frame_idx,
                             "time_sec":  frame_idx / fps,
                             "dets":      dets})
 
     # --- Pass 2: identity assignment with FROZEN appearance anchors ------
-    # The two dancers are separated up-front into two fixed colour anchors built
-    # from all "clean" frames (both dancers near full size), then every frame is
-    # assigned against those frozen anchors plus spatial continuity. Freezing the
-    # anchors — rather than updating a per-frame EMA reference — is what makes this
-    # robust: a single bad frame (a reflection at the walk-on, or one swap during an
-    # occlusion) can't poison the reference and lock the identities swapped.
+    # Each dancer is pinned to a fixed colour anchor, then every frame is assigned
+    # against those frozen anchors plus spatial continuity. Freezing the anchors —
+    # rather than updating a per-frame EMA reference — is what makes this robust: a
+    # single bad frame (a reflection at the walk-on, or one swap during an occlusion)
+    # can't poison the reference and lock the identities swapped.
+    #   Unseeded: anchors from constrained 2-clustering of clean 2-person frames.
+    #   Seeded:   anchors from the two people pointed at in the seed frame, refined
+    #             once from their matched detections; all detections are matched and
+    #             non-matching ones (other couples) are ignored.
     frames_out = []
 
     def _scale(dets):
@@ -161,86 +187,144 @@ def extract_poses(video_path: str, conf: float = CONF_THRESHOLD, frame_skip: int
         cv2.normalize(m, m, 0, 1, cv2.NORM_MINMAX)
         return m
 
-    # Clean two-person frames: both detections near full size + both have a signature
-    all_bh = [body_height(d["kps"]) for rec in raw_frames for d in rec["dets"]]
-    med_bh = float(np.median(all_bh)) if all_bh else 0.0
-    clean = [rec["dets"] for rec in raw_frames
-             if len(rec["dets"]) == 2 and med_bh > 0
-             and body_height(rec["dets"][0]["kps"]) >= 0.6 * med_bh
-             and body_height(rec["dets"][1]["kps"]) >= 0.6 * med_bh
-             and rec["dets"][0]["sig"] is not None
-             and rec["dets"][1]["sig"] is not None]
-
-    # Build two anchors by constrained 2-clustering of the clean-frame pairs: the two
-    # detections in any frame are different people, so each pair is split across the two
-    # clusters. Seeded by the most-different-looking pair, then refined a few passes.
     anchor = {1: None, 2: None}
-    if len(clean) >= 3:
-        pairs = [(d[0]["sig"], d[1]["sig"], float(d[0]["center"][0]), float(d[1]["center"][0]))
-                 for d in clean]
-        seed = max(pairs, key=lambda p: _app_dist(p[0], p[1]))
-        a_sig = seed[0] if seed[2] <= seed[3] else seed[1]      # left det of seed → cluster A
-        b_sig = seed[1] if seed[2] <= seed[3] else seed[0]
-        for _ in range(3):
-            a_acc, b_acc = [], []
-            for s0, s1, _x0, _x1 in pairs:
-                if _app_dist(s0, a_sig) + _app_dist(s1, b_sig) <= \
-                   _app_dist(s0, b_sig) + _app_dist(s1, a_sig):
-                    a_acc.append(s0); b_acc.append(s1)
-                else:
-                    a_acc.append(s1); b_acc.append(s0)
-            a_sig, b_sig = _avg_sig(a_acc), _avg_sig(b_acc)
-        # Map clusters A/B → Dancer 1/2 by which identity is on the LEFT at the
-        # first clean frame (keeps the "left = Dancer 1" convention).
-        s0, s1, x0, x1 = pairs[0]
-        det0_is_a = (_app_dist(s0, a_sig) + _app_dist(s1, b_sig)
-                     <= _app_dist(s0, b_sig) + _app_dist(s1, a_sig))
-        left_is_a = det0_is_a if x0 <= x1 else (not det0_is_a)
-        anchor[1], anchor[2] = (a_sig, b_sig) if left_is_a else (b_sig, a_sig)
+    seed_center = {1: None, 2: None}
+
+    if seeded:
+        # Anchor each dancer to the detection nearest its seed point in the seed frame.
+        target = min(raw_frames, key=lambda r: abs(r["frame_idx"] - (seed_frame_idx or 0)))
+        for did, pt in zip((1, 2), seed_points):
+            if target["dets"]:
+                best = min(target["dets"],
+                           key=lambda d: float(np.hypot(d["center"][0] - pt[0],
+                                                         d["center"][1] - pt[1])))
+                anchor[did]      = best["sig"]
+                seed_center[did] = np.asarray(best["center"], dtype=float)
+    else:
+        # Clean two-person frames: both detections near full size + both have a signature
+        all_bh = [body_height(d["kps"]) for rec in raw_frames for d in rec["dets"]]
+        med_bh = float(np.median(all_bh)) if all_bh else 0.0
+        clean = [rec["dets"][:MAX_DANCERS] for rec in raw_frames
+                 if len(rec["dets"]) == 2 and med_bh > 0
+                 and body_height(rec["dets"][0]["kps"]) >= 0.6 * med_bh
+                 and body_height(rec["dets"][1]["kps"]) >= 0.6 * med_bh
+                 and rec["dets"][0]["sig"] is not None
+                 and rec["dets"][1]["sig"] is not None]
+        # Constrained 2-clustering of clean-frame pairs: the two detections in any frame
+        # are different people, so each pair is split across the two clusters. Seeded by
+        # the most-different-looking pair, then refined a few passes.
+        if len(clean) >= 3:
+            pairs = [(d[0]["sig"], d[1]["sig"], float(d[0]["center"][0]), float(d[1]["center"][0]))
+                     for d in clean]
+            seed = max(pairs, key=lambda p: _app_dist(p[0], p[1]))
+            a_sig = seed[0] if seed[2] <= seed[3] else seed[1]      # left det of seed → cluster A
+            b_sig = seed[1] if seed[2] <= seed[3] else seed[0]
+            for _ in range(3):
+                a_acc, b_acc = [], []
+                for s0, s1, _x0, _x1 in pairs:
+                    if _app_dist(s0, a_sig) + _app_dist(s1, b_sig) <= \
+                       _app_dist(s0, b_sig) + _app_dist(s1, a_sig):
+                        a_acc.append(s0); b_acc.append(s1)
+                    else:
+                        a_acc.append(s1); b_acc.append(s0)
+                a_sig, b_sig = _avg_sig(a_acc), _avg_sig(b_acc)
+            # Map clusters A/B → Dancer 1/2 by which identity is on the LEFT at the
+            # first clean frame (keeps the "left = Dancer 1" convention).
+            s0, s1, x0, x1 = pairs[0]
+            det0_is_a = (_app_dist(s0, a_sig) + _app_dist(s1, b_sig)
+                         <= _app_dist(s0, b_sig) + _app_dist(s1, a_sig))
+            left_is_a = det0_is_a if x0 <= x1 else (not det0_is_a)
+            anchor[1], anchor[2] = (a_sig, b_sig) if left_is_a else (b_sig, a_sig)
 
     use_app = anchor[1] is not None and anchor[2] is not None
 
-    last_center = {1: None, 2: None}
-
-    def _cost(det, did, scale):
-        spatial = (np.linalg.norm(det["center"] - last_center[did]) / scale
-                   if last_center[did] is not None else 0.0)
-        appear  = APP_WEIGHT * _app_dist(det["sig"], anchor[did]) if use_app else 0.0
+    def _cost(det, did, scale, lc):
+        spatial = (np.linalg.norm(det["center"] - lc[did]) / max(scale, 1.0)
+                   if lc[did] is not None else 0.0)
+        appear  = APP_WEIGHT * _app_dist(det["sig"], anchor[did]) if anchor[did] is not None else 0.0
         return spatial + appear
+
+    def _passes_gate(det, did, scale, lc):
+        # Reject detections that are clearly not the seeded dancer.
+        if anchor[did] is not None and det["sig"] is not None:
+            return _app_dist(det["sig"], anchor[did]) <= APP_GATE
+        if lc[did] is not None:        # no colour info → require motion continuity
+            return np.linalg.norm(det["center"] - lc[did]) / max(scale, 1.0) <= SPATIAL_GATE
+        return False                   # first sighting, no colour, no position → unsafe
+
+    def _assign_seeded(dets, scale, lc):
+        """Match ALL detections to the two anchors. Returns {did: det_index}; a dancer
+        may be left unassigned (occluded), and no detection is shared by both."""
+        cands = sorted(((_cost(det, did, scale, lc), did, j)
+                        for j, det in enumerate(dets) for did in (1, 2)),
+                       key=lambda c: c[0])
+        out, used = {}, set()
+        for _c, did, j in cands:
+            if did in out or j in used:
+                continue
+            if not _passes_gate(dets[j], did, scale, lc):
+                continue
+            out[did] = j; used.add(j)
+        return out
+
+    if seeded:
+        # One refinement pass: rough-assign across the clip to gather each dancer's
+        # matched colour signatures, average them into sturdier anchors, then re-run.
+        lc = {1: seed_center[1], 2: seed_center[2]}
+        sig_acc = {1: [], 2: []}
+        for rec in raw_frames:
+            scale = _scale(rec["dets"])
+            for did, j in _assign_seeded(rec["dets"], scale, lc).items():
+                lc[did] = np.asarray(rec["dets"][j]["center"], dtype=float)
+                if rec["dets"][j]["sig"] is not None:
+                    sig_acc[did].append(rec["dets"][j]["sig"])
+        for did in (1, 2):
+            avg = _avg_sig(sig_acc[did])
+            if avg is not None:
+                anchor[did] = avg
+
+    last_center = {1: seed_center[1], 2: seed_center[2]} if seeded else {1: None, 2: None}
 
     for rec in raw_frames:
         dets = rec["dets"]
         dancers: dict[int, np.ndarray] = {}
         scale = _scale(dets)
 
-        if len(dets) == 0:
-            pass  # both missing this frame
+        if seeded:
+            for did, j in _assign_seeded(dets, scale, last_center).items():
+                dancers[did]     = dets[j]["kps"]
+                last_center[did] = np.asarray(dets[j]["center"], dtype=float)
 
-        elif len(dets) == 1:
-            det = dets[0]
-            if last_center[1] is None and last_center[2] is None and not use_app:
-                did = 1
-            else:
-                did = 1 if _cost(det, 1, scale) <= _cost(det, 2, scale) else 2
-            dancers[did]     = det["kps"]
-            last_center[did] = det["center"]
+        else:
+            dets = dets[:MAX_DANCERS]   # unseeded: only the top-2 by confidence
+            if len(dets) == 0:
+                pass  # both missing this frame
 
-        else:  # 2 detections
-            d0, d1 = dets[0], dets[1]
-            if (last_center[1] is None and last_center[2] is None) and not use_app:
-                # No anchors and nothing seen yet: label by horizontal position
-                lo, hi = (d0, d1) if d0["center"][0] <= d1["center"][0] else (d1, d0)
-                dancers[1], dancers[2]         = lo["kps"], hi["kps"]
-                last_center[1], last_center[2] = lo["center"], hi["center"]
-            else:
-                cost_a = _cost(d0, 1, scale) + _cost(d1, 2, scale)   # d0→1, d1→2
-                cost_b = _cost(d0, 2, scale) + _cost(d1, 1, scale)   # d0→2, d1→1
-                if cost_a <= cost_b:
-                    dancers[1], dancers[2]         = d0["kps"], d1["kps"]
-                    last_center[1], last_center[2] = d0["center"], d1["center"]
+            elif len(dets) == 1:
+                det = dets[0]
+                if last_center[1] is None and last_center[2] is None and not use_app:
+                    did = 1
                 else:
-                    dancers[1], dancers[2]         = d1["kps"], d0["kps"]
-                    last_center[1], last_center[2] = d1["center"], d0["center"]
+                    did = 1 if _cost(det, 1, scale, last_center) <= _cost(det, 2, scale, last_center) else 2
+                dancers[did]     = det["kps"]
+                last_center[did] = det["center"]
+
+            else:  # 2 detections
+                d0, d1 = dets[0], dets[1]
+                if (last_center[1] is None and last_center[2] is None) and not use_app:
+                    # No anchors and nothing seen yet: label by horizontal position
+                    lo, hi = (d0, d1) if d0["center"][0] <= d1["center"][0] else (d1, d0)
+                    dancers[1], dancers[2]         = lo["kps"], hi["kps"]
+                    last_center[1], last_center[2] = lo["center"], hi["center"]
+                else:
+                    cost_a = _cost(d0, 1, scale, last_center) + _cost(d1, 2, scale, last_center)
+                    cost_b = _cost(d0, 2, scale, last_center) + _cost(d1, 1, scale, last_center)
+                    if cost_a <= cost_b:
+                        dancers[1], dancers[2]         = d0["kps"], d1["kps"]
+                        last_center[1], last_center[2] = d0["center"], d1["center"]
+                    else:
+                        dancers[1], dancers[2]         = d1["kps"], d0["kps"]
+                        last_center[1], last_center[2] = d1["center"], d0["center"]
 
         frames_out.append({
             "frame_idx": rec["frame_idx"],
@@ -251,7 +335,12 @@ def extract_poses(video_path: str, conf: float = CONF_THRESHOLD, frame_skip: int
     d1_count = sum(1 for f in frames_out if 1 in f["dancers"])
     d2_count = sum(1 for f in frames_out if 2 in f["dancers"])
     both     = sum(1 for f in frames_out if 1 in f["dancers"] and 2 in f["dancers"])
-    print(f"  Dancer 1: {d1_count} frames  |  Dancer 2: {d2_count} frames  |  Both: {both} frames")
+    mode = "seeded" if seeded else "top-2"
+    print(f"  [{mode}, model={model_name}]  Dancer 1: {d1_count} frames  |  "
+          f"Dancer 2: {d2_count} frames  |  Both: {both} frames")
+    if seeded and both < 0.5 * len(frames_out):
+        print("  NOTE: target couple matched in <50% of frames — they may be heavily "
+              "occluded, or the seed points/anchors are off. Try a clearer seed frame.")
 
     return {
         "fps":          fps,
@@ -259,8 +348,42 @@ def extract_poses(video_path: str, conf: float = CONF_THRESHOLD, frame_skip: int
         "width":        width,
         "height":       height,
         "dancer_ids":   [1, 2],
+        "model":        model_name,
+        "seeded":       seeded,
         "frames":       frames_out,
     }
+
+
+def detect_single_frame(video_path: str, t_sec: float,
+                        model_name: str = "yolov8m-pose.pt",
+                        conf: float = CONF_THRESHOLD):
+    """Detect all people in ONE frame (at t_sec seconds) for the crowd-mode seed step.
+
+    Returns (frame_idx, bgr_image, dets) where dets is a confidence-sorted list of
+    {center: [x,y], box: [x0,y0,x1,y1], conf: float, kps: ndarray}. The caller labels
+    the people so the user can point out which two are the target couple.
+    """
+    cap = cv2.VideoCapture(video_path)
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    frame_idx = int(round(t_sec * fps))
+    cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+    ok, img = cap.read()
+    cap.release()
+    if not ok:
+        raise RuntimeError(f"Could not read frame at {t_sec}s ({video_path})")
+
+    res = YOLO(model_name)(img, conf=conf, verbose=False)[0]
+    dets = []
+    if res.keypoints is not None and res.boxes is not None:
+        kps_all = res.keypoints.data.cpu().numpy()
+        boxes   = res.boxes.xyxy.cpu().numpy()
+        scores  = res.boxes.conf.cpu().numpy()
+        for i in np.argsort(scores)[::-1]:
+            dets.append({"center": _hip_center(kps_all[i]),
+                         "box":    boxes[i],
+                         "conf":   float(scores[i]),
+                         "kps":    kps_all[i]})
+    return frame_idx, img, dets
 
 
 # ---------------------------------------------------------------------------
@@ -363,15 +486,26 @@ def main():
     parser.add_argument("--out",       default=None, help="Output path (.json). Defaults to <video>.poses.json")
     parser.add_argument("--conf",      type=float, default=CONF_THRESHOLD, help="Detection confidence threshold")
     parser.add_argument("--skip",      type=int,   default=1, help="Process every Nth frame")
-    parser.add_argument("--model",     default="yolov8n-pose.pt",
-                        help="YOLOv8 pose model (n=fastest, s/m/l/x=more accurate)")
+    parser.add_argument("--model",     default="yolov8m-pose.pt",
+                        help="YOLOv8 pose model (n=fastest, s/m/l/x=more accurate). "
+                             "Default m; use l/x for max accuracy on small/crowded figures.")
+    parser.add_argument("--seed-frame", type=int, default=None,
+                        help="Frame index of the seed frame for crowd mode (pair with --seed-me/--seed-partner).")
+    parser.add_argument("--seed-me",      default=None, help="'x,y' pixel point on dancer 1 in the seed frame.")
+    parser.add_argument("--seed-partner", default=None, help="'x,y' pixel point on dancer 2 in the seed frame.")
     args = parser.parse_args()
 
     video_path = args.video
     out_path   = args.out or str(Path(video_path).with_suffix(".poses.json"))
 
+    seed_points = None
+    if args.seed_me and args.seed_partner:
+        seed_points = [tuple(float(v) for v in args.seed_me.split(",")),
+                       tuple(float(v) for v in args.seed_partner.split(","))]
+
     print(f"Extracting poses from: {video_path}")
-    data = extract_poses(video_path, conf=args.conf, frame_skip=args.skip, model_name=args.model)
+    data = extract_poses(video_path, conf=args.conf, frame_skip=args.skip, model_name=args.model,
+                         seed_frame_idx=args.seed_frame, seed_points=seed_points)
 
     n_frames  = len(data["frames"])
     n_dancers = len(data["dancer_ids"])

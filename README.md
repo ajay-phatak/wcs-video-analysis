@@ -122,10 +122,38 @@ python wcs-analyze-skill/scripts/analyze.py path/to/your_video.mp4 --compare-pro
 - `--compare-pros` — print gap analysis vs your pro references.
 - `--partner` — also show your partner's comparison (vs each pro of the other role).
 - `--spotlight` — mark a full-floor showcase clip (otherwise treated as contained).
+- `--pose-model n|s|m|l|x` — YOLOv8-pose model size (default `m`). Use `l`/`x` for
+  max accuracy on small or crowded figures (slower; poses are cached once).
 - `--output-dir <dir>` — where to save reports (default: same directory as the video).
 
-Pose extraction is slow (~3–5 min for a 3-min video). Results are cached as
-`<stem>_poses.json` next to the video; subsequent runs are instant.
+Pose extraction is slow (a few minutes for a multi-minute clip; longer with `l`/`x`).
+Results are cached as `<stem>_poses.json` next to the video; subsequent runs are instant.
+
+---
+
+## Crowded footage — pick your couple
+
+By default the analyser assumes the only two people on screen are the couple. On a
+crowded floor (a prelim heat, a social) that breaks down: it can't tell which two
+detections are *you*. Crowd mode seeds the tracking to your couple in two steps:
+
+```bash
+# Step 1 — render a numbered preview of everyone detected at ~45s in:
+python wcs-analyze-skill/scripts/analyze.py path/to/clip.mp4 --seed-frame 45
+
+# Open <stem>_seed.png, find the number on you and on your partner, then:
+# Step 2 — re-extract, tracking only your couple out of the crowd:
+python wcs-analyze-skill/scripts/analyze.py path/to/clip.mp4 \
+    --seed-me-idx 3 --seed-partner-idx 5 --compare-pros --partner
+```
+
+Seeding builds an appearance + motion model of the two people you point at and matches
+every frame against it, ignoring other couples; when you're occluded the dancer is left
+*missing* rather than swapped onto a stranger. It also pins **dancer 1 = you, dancer 2 =
+partner**, so `--me`/`--me-id` aren't needed. Pick a seed frame where both of you are
+clearly visible. Note: isolating your couple fixes *identity*, not *resolution* — if you
+fill little of the frame, the fine per-dancer joint metrics stay approximate; the
+partnership and rhythm metrics are the reliable reads from distant footage.
 
 ---
 
