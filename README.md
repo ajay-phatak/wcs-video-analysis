@@ -179,10 +179,30 @@ connector. This is entirely optional — the pipeline works standalone without i
 
 ## Pose model
 
-YOLOv8-pose, COCO-17 keypoints. There is **no foot keypoint** in COCO-17; ankle
-lift is estimated as a proxy from the moving-foot's vertical excursion. Joint angles
-are 2-D side-on estimates — good for relative you-vs-pro comparisons, not absolute
-biomechanical measurements.
+Pass 1 is YOLOv8-pose, COCO-17 keypoints. On COCO-17-only pose files, metrics
+fall back to proxies: ankle lift stands in for foot articulation (COCO-17 has no
+foot keypoint) and joint angles are 2-D side-on estimates. With the refinement
+passes below, the metrics automatically upgrade themselves per pose file:
+
+- **Halpe-26 feet present** → articulated-step classification keys off true heel
+  lift, the foot-lift metric uses the big toe's ground clearance, and two new
+  balance states appear: **1-foot airborne %** (true single-leg, free foot fully
+  off the floor) and **ball-of-foot %** (heel released, toes grounded — rolling
+  action; a strong pro-vs-amateur differentiator).
+- **Lifted 3D present** → knee/hip articulation angles are computed from the 3-D
+  joints, making them camera-angle invariant — you-vs-pro angle comparisons are
+  no longer biased by the two clips being filmed from different positions.
+- **Landing roll-through** (feet) → each articulated step's landing is classified
+  toe-first / flat / heel-first / ball-only from the toe and heel's ground-contact
+  order (±33 ms resolution at 30 fps).
+- **3-D body action** → torso pitch is true sagittal lean, sway tilts are true
+  lateral tilts (robust percentile ranges), and a new **upper/lower rotation
+  dissociation** measures the shoulder line turning against the hip line about
+  the vertical axis — invisible to a 2-D camera, which sees rotation only as
+  foreshortening.
+
+The report annotates which sources were used (`Foot lift (big toe)` vs
+`Ankle lift (proxy)`; `joint angles are 3-D lifted` vs `2-D side-on estimates`).
 
 ### The three-pass extraction pipeline
 

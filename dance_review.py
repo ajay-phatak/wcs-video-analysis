@@ -148,6 +148,10 @@ def _leg_action_section(label: str, data: dict, coverage_pct: float, lines: list
     triple   = data.get("triple_step_count", 0)
     one_foot = data.get("one_foot_pct", 0.0)
     two_foot = data.get("two_foot_pct", 0.0)
+    airborne = data.get("one_foot_airborne_pct", 0.0)
+    ball     = data.get("ball_foot_pct", 0.0)
+    feet_ok  = data.get("foot_kps_used", False)
+    angle_3d = data.get("art_angle_source", "2d") == "3d"
 
     art_trav = data.get("step_count_articulated_traveling", 0)
     art_ip   = data.get("step_count_articulated_in_place", 0)
@@ -200,9 +204,22 @@ def _leg_action_section(label: str, data: dict, coverage_pct: float, lines: list
         f"      (% of the moving-leg bend re-straightened — the rise as weight arrives on the new foot)",
         f"    Prep→arrival sequencing : {_pct_bar(art_prep)}{_flag(art_prep, 40, 65)}",
         f"      (% of steps where the bend happens while the foot is free (prep), then straightens after it grounds)",
-        f"    Ankle lift (proxy)      : {art_ankle:.3f} BH",
-        f"      (moving-foot vertical excursion — push through the ball of foot; NOT a true ankle angle)",
-        f"      (note: joint angles are 2-D side-on estimates; musical accents e.g. deep lunges are valid exceptions)",
+        *([
+            f"    Landing roll-through    : toe-first {data.get('art_toe_first_pct', 0.0):.0f}%   "
+            f"flat {data.get('art_flat_pct', 0.0):.0f}%   heel-first {data.get('art_heel_first_pct', 0.0):.0f}%   "
+            f"ball-only {data.get('art_ball_only_pct', 0.0):.0f}%   ({data.get('art_roll_n', 0):.0f} landings)",
+            f"      (how the moving foot takes weight — toe/ball first then heel = rolling through the foot;",
+            f"       ball-only = heel stays released, e.g. triples/anchors on the ball; mean toe→heel lag "
+            f"{data.get('art_roll_lag_ms', 0.0):+.0f} ms; ±33 ms resolution at 30 fps — 'flat' = same frame)",
+        ] if feet_ok else []),
+        (f"    Foot lift (big toe)     : {art_ankle:.3f} BH" if feet_ok else
+         f"    Ankle lift (proxy)      : {art_ankle:.3f} BH"),
+        (f"      (moving foot's toe vertical excursion — true ground clearance from Halpe-26 foot keypoints)"
+         if feet_ok else
+         f"      (moving-foot vertical excursion — push through the ball of foot; NOT a true ankle angle)"),
+        (f"      (note: joint angles are 3-D lifted — camera-angle invariant; musical accents e.g. deep lunges are valid exceptions)"
+         if angle_3d else
+         f"      (note: joint angles are 2-D side-on estimates; musical accents e.g. deep lunges are valid exceptions)"),
         "",
         f"    Rise/fall (typical)     : {rf_typ:.3f}  (median bounce on average steps)",
         f"    Rise/fall (dynamic)     : {rf_dyn:.3f}  (95th-pct — biggest level changes)",
@@ -214,6 +231,13 @@ def _leg_action_section(label: str, data: dict, coverage_pct: float, lines: list
         f"      1-foot (ankle ≥5% bh) : {_pct_bar(one_foot)}{one_foot:5.1f}%",
         f"      2-foot (both grounded): {_pct_bar(two_foot)}{two_foot:5.1f}%",
         f"      (1-foot: one ankle elevated ≥5% body-height — includes heel raise, brush, toe-touch)",
+    ]
+    if feet_ok:
+        lines += [
+            f"      1-foot airborne       : {_pct_bar(airborne)}{airborne:5.1f}%   (true single-leg — the free foot fully off the floor)",
+            f"      ball-of-foot          : {_pct_bar(ball)}{ball:5.1f}%   (a heel released, toes grounded — rolling action)",
+        ]
+    lines += [
         "",
     ]
 
@@ -237,12 +261,17 @@ def _body_action_section(label: str, data: dict, coverage_pct: float, lines: lis
     hi_tilt    = data.get("hip_tilt_range_deg",      0.0)
     sway_hz    = data.get("sway_rhythm_hz",          0.0)
     sway_diss  = data.get("upper_lower_sway_dissoc", 0.0)
+    body_3d    = data.get("body_angle_source", "2d") == "3d"
+    rot_mean   = data.get("upper_lower_rotation_mean_deg", 0.0)
+    rot_p90    = data.get("upper_lower_rotation_p90_deg", 0.0)
 
     lines += [
         "  PITCH  (forward/backward lean along the slot)",
         DIV,
         f"    Pitch range             : {pitch_rng:.1f}°{_flag(pitch_rng, 5, 15)}",
-        f"      (torso lean angle in image plane; 0° = upright, higher = more forward/back usage)",
+        (f"      (true sagittal torso lean from 3-D joints — camera-angle invariant; 0° = upright)"
+         if body_3d else
+         f"      (torso lean angle in image plane; 0° = upright, higher = more forward/back usage)"),
         f"    Pitch rhythm            : {pitch_hz:.2f} Hz  ({pitch_hz * 60:.1f} cycles/min)",
         "",
         "  FLUIDITY  (sequential propagation through the body)",
@@ -261,6 +290,17 @@ def _body_action_section(label: str, data: dict, coverage_pct: float, lines: lis
         f"    Upper/lower dissociation: {sway_diss:.1f}°{_flag(sway_diss, 3, 10)}",
         f"      (how much shoulder tilt differs from hip tilt)",
         f"    Sway rhythm             : {sway_hz:.2f} Hz  ({sway_hz * 60:.1f} cycles/min)",
+    ]
+    if body_3d:
+        lines += [
+            "",
+            "  ROTATION  (upper vs lower body, about the vertical axis — 3-D only)",
+            DIV,
+            f"    Rotation dissociation   : mean {rot_mean:.1f}°   p90 {rot_p90:.1f}°",
+            f"      (shoulder line turned against the hip line in the horizontal plane —",
+            f"       swivels, body lead; invisible to a 2-D camera, which sees rotation as foreshortening)",
+        ]
+    lines += [
         "",
     ]
 

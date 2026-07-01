@@ -81,7 +81,74 @@ def _detrend_fft(sig: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
 
 
 def _valid(kps: np.ndarray, idx: int) -> bool:
-    return kps[idx, 2] >= CONF_MIN
+    return kps.shape[0] > idx and kps[idx, 2] >= CONF_MIN
+
+
+# ---------------------------------------------------------------------------
+# Refined-pose extras: Halpe-26 foot keypoints (pass 2) and lifted 3D joints
+# (pass 3). Both are optional — every consumer falls back to the COCO-17
+# proxies when a pose file predates the refinement pipeline.
+# ---------------------------------------------------------------------------
+
+# Halpe-26 rows 17+ (rows 0-16 are COCO-17, same as KP)
+FKP = {
+    "left_big_toe": 20,   "right_big_toe": 21,
+    "left_small_toe": 22, "right_small_toe": 23,
+    "left_heel": 24,      "right_heel": 25,
+}
+
+# H36M-17 joint order of the lifted 3D poses (differs from COCO — see pose_lift.py)
+KP3D = {
+    "pelvis": 0, "right_hip": 1, "right_knee": 2, "right_ankle": 3,
+    "left_hip": 4, "left_knee": 5, "left_ankle": 6, "spine": 7,
+    "thorax": 8, "neck": 9, "head": 10, "left_shoulder": 11,
+    "left_elbow": 12, "left_wrist": 13, "right_shoulder": 14,
+    "right_elbow": 15, "right_wrist": 16,
+}
+
+
+def _feet_available(frames: list, dancer_id: int) -> bool:
+    """True when the clip's poses carry usable Halpe-26 foot keypoints for this
+    dancer (heels confident in a meaningful share of sampled frames)."""
+    seen = hits = 0
+    for f in frames[:: max(1, len(frames) // 100)]:
+        kps = f["dancers"].get(dancer_id)
+        if kps is None:
+            continue
+        seen += 1
+        if _valid(kps, FKP["left_heel"]) or _valid(kps, FKP["right_heel"]):
+            hits += 1
+    return seen > 0 and hits / seen >= 0.5
+
+
+def _kps3d(frame: dict, dancer_id: int) -> np.ndarray | None:
+    """Lifted 3D joints (17,3) for a dancer in one frame, or None. JSON round-
+    trips leave dancers3d with string keys and list values — normalise here."""
+    d3 = frame.get("dancers3d")
+    if not d3:
+        return None
+    v = d3.get(dancer_id, d3.get(str(dancer_id)))
+    if v is None:
+        return None
+    return v if isinstance(v, np.ndarray) else np.asarray(v, dtype=float)
+
+
+def _pose3d_available(frames: list, dancer_id: int) -> bool:
+    for f in frames[:: max(1, len(frames) // 20)]:
+        if _kps3d(f, dancer_id) is not None:
+            return True
+    return False
+
+
+def _angle3d(k3: np.ndarray, a_idx: int, b_idx: int, c_idx: int) -> float | None:
+    """Interior angle (degrees) at 3D joint b — rotation/camera invariant."""
+    ba = k3[a_idx] - k3[b_idx]
+    bc = k3[c_idx] - k3[b_idx]
+    na, nc = float(np.linalg.norm(ba)), float(np.linalg.norm(bc))
+    if na < 1e-6 or nc < 1e-6:
+        return None
+    cos = float(np.dot(ba, bc) / (na * nc))
+    return float(np.degrees(np.arccos(np.clip(cos, -1.0, 1.0))))
 
 
 def _times(frames: list, dancer_id: int) -> np.ndarray:
@@ -95,7 +162,7 @@ def _kp_series(frames: list, dancer_id: int, kp_idx: int) -> tuple[np.ndarray, n
         if dancer_id not in f["dancers"]:
             continue
         kps = f["dancers"][dancer_id]
-        if kps[kp_idx, 2] >= CONF_MIN:
+        if _valid(kps, kp_idx):
             times.append(f["time_sec"])
             xs.append(kps[kp_idx, 0])
             ys.append(kps[kp_idx, 1])
@@ -379,11 +446,20 @@ def detect_step_events(frames: list, dancer_id: int, fps: float) -> dict:
         return {"articulated": [], "weight_only": [], "all": [],
                 "articulated_traveling": [], "articulated_in_place": [],
                 "weight_only_traveling": [], "weight_only_in_place": [],
-                "one_foot_pct": 0.0, "two_foot_pct": 0.0}
+                "one_foot_pct": 0.0, "two_foot_pct": 0.0,
+                "one_foot_airborne_pct": 0.0, "ball_foot_pct": 0.0,
+                "foot_kps_used": False}
 
-    # ---- build smoothed ankle vertical series for lift measurement ----
+    # ---- build smoothed vertical series for lift measurement ----
+    # With Halpe-26 feet, the HEEL is the true lift signal ("heel lifts clear of
+    # the ground" is the definition of an articulated step); the ankle sits a
+    # variable distance above ground depending on camera angle, so it's only the
+    # fallback for pass-1 poses.
+    feet_ok = _feet_available(frames, dancer_id)
+    lift_kp_idxs = ([FKP["left_heel"], FKP["right_heel"]] if feet_ok
+                    else [KP["left_ankle"], KP["right_ankle"]])
     ankle_series: dict[int, tuple[np.ndarray, np.ndarray]] = {}
-    for kp_idx in [KP["left_ankle"], KP["right_ankle"]]:
+    for kp_idx in lift_kp_idxs:
         t_a, _, y_a = _kp_series(frames, dancer_id, kp_idx)
         if len(t_a) >= SMOOTH_WINDOW + 2:
             ankle_series[kp_idx] = (t_a, _smooth(y_a))
@@ -482,8 +558,30 @@ def detect_step_events(frames: list, dancer_id: int, fps: float) -> dict:
         weight_only_in_place = list(weight_only)
 
     # ---- per-frame 1-foot vs 2-foot balance ----
+    # Ankle proxy (all pose files): one ankle elevated ≥5% bh → "1-foot", which
+    # deliberately lumps heel raises / brushes / toe-touches in with a fully
+    # lifted foot (an ankle can't tell them apart).
+    # With Halpe-26 feet two finer states are also measured:
+    #   airborne = one foot's LOWEST contact point (heel/toes) clearly above the
+    #              grounded foot → true single-leg balance, no floor contact.
+    #   ball     = a heel raised while its own toes stay grounded → dancing on
+    #              the ball of the foot (rolling action), still floor contact.
     one_foot_count = 0
     two_foot_count = 0
+    airborne_count = 0
+    ball_count     = 0
+
+    def _foot_pts(kps, side):
+        """(lowest_contact_y, heel_y, toe_y) for one foot — None where unmeasurable."""
+        heel = kps[FKP[f"{side}_heel"]]     if _valid(kps, FKP[f"{side}_heel"])     else None
+        big  = kps[FKP[f"{side}_big_toe"]]  if _valid(kps, FKP[f"{side}_big_toe"])  else None
+        small = kps[FKP[f"{side}_small_toe"]] if _valid(kps, FKP[f"{side}_small_toe"]) else None
+        toe_y = max((float(p[1]) for p in (big, small) if p is not None), default=None)
+        ys = [float(p[1]) for p in (heel, big, small) if p is not None]
+        low_y = max(ys) if ys else None          # image y grows downward → max = lowest
+        heel_y = float(heel[1]) if heel is not None else None
+        return low_y, heel_y, toe_y
+
     for f in frames:
         if dancer_id not in f["dancers"]:
             continue
@@ -502,9 +600,26 @@ def detect_step_events(frames: list, dancer_id: int, fps: float) -> dict:
         else:
             two_foot_count += 1
 
+        if feet_ok:
+            l_low, l_heel, l_toe = _foot_pts(kps, "left")
+            r_low, r_heel, r_toe = _foot_pts(kps, "right")
+            if l_low is not None and r_low is not None:
+                floor_y = max(l_low, r_low)      # the grounded foot defines the floor
+                if abs(l_low - r_low) / bh > BALANCE_THRESH:
+                    airborne_count += 1
+                for heel_y, toe_y, low in ((l_heel, l_toe, l_low), (r_heel, r_toe, r_low)):
+                    # ball-of-foot: heel clearly above the floor line, toes on it
+                    if (heel_y is not None and toe_y is not None
+                            and (floor_y - heel_y) / bh > BALANCE_THRESH
+                            and (floor_y - toe_y) / bh <= BALANCE_THRESH):
+                        ball_count += 1
+                        break
+
     total_balance = one_foot_count + two_foot_count
     one_foot_pct = round(100.0 * one_foot_count / max(total_balance, 1), 1)
     two_foot_pct = round(100.0 * two_foot_count / max(total_balance, 1), 1)
+    one_foot_airborne_pct = round(100.0 * airborne_count / max(total_balance, 1), 1) if feet_ok else 0.0
+    ball_foot_pct         = round(100.0 * ball_count     / max(total_balance, 1), 1) if feet_ok else 0.0
 
     return {
         "articulated":            articulated,
@@ -516,6 +631,9 @@ def detect_step_events(frames: list, dancer_id: int, fps: float) -> dict:
         "weight_only_in_place":   weight_only_in_place,
         "one_foot_pct":           one_foot_pct,
         "two_foot_pct":           two_foot_pct,
+        "one_foot_airborne_pct":  one_foot_airborne_pct,
+        "ball_foot_pct":          ball_foot_pct,
+        "foot_kps_used":          feet_ok,
     }
 
 
@@ -546,6 +664,8 @@ _ART_QUALITY_KEYS = (
     "art_free_knee_p90", "art_weighted_knee_p90",
     "art_knee_hip_coord", "art_smoothness", "art_straighten_pct", "art_prep_pct",
     "art_ankle_lift",
+    "art_toe_first_pct", "art_heel_first_pct", "art_flat_pct", "art_ball_only_pct",
+    "art_roll_lag_ms", "art_roll_n",
 )
 
 
@@ -577,22 +697,53 @@ def _articulation_per_step(frames: list, dancer_id: int, fps: float,
         "left":  (KP["left_hip"],  KP["left_knee"],  KP["left_ankle"],  KP["left_shoulder"]),
         "right": (KP["right_hip"], KP["right_knee"], KP["right_ankle"], KP["right_shoulder"]),
     }
-    series: dict = {leg: {"t": [], "knee": [], "hip": [], "ankle_y": []} for leg in legs}
+    # H36M indices for the 3D angle upgrade (hip, knee, ankle, thorax)
+    legs3d = {
+        "left":  (KP3D["left_hip"],  KP3D["left_knee"],  KP3D["left_ankle"],  KP3D["thorax"]),
+        "right": (KP3D["right_hip"], KP3D["right_knee"], KP3D["right_ankle"], KP3D["thorax"]),
+    }
+    # Joint angles: lifted 3D when available (rotation/camera-invariant — a knee
+    # bend reads the same regardless of where the camera stood, so you-vs-pro
+    # comparisons aren't biased by differing camera angles), else 2D projection.
+    # Foot-free detection: the big toe directly encodes ground contact — a foot
+    # on the ball (heel up, toes down) is WEIGHTED, which the ankle proxy
+    # misreads as free. Toe used when Halpe-26 feet are present.
+    use_3d  = _pose3d_available(frames, dancer_id)
+    feet_ok = _feet_available(frames, dancer_id)
+    toe_idx = {"left": FKP["left_big_toe"], "right": FKP["right_big_toe"]}
+
+    heel_idx = {"left": FKP["left_heel"], "right": FKP["right_heel"]}
+
+    series: dict = {leg: {"t": [], "knee": [], "hip": [], "ankle_y": [], "heel_y": []}
+                    for leg in legs}
     b_t, b_com, b_pit = [], [], []      # body-level: time, hip-centre y, torso pitch
     for f in frames:
         if dancer_id not in f["dancers"]:
             continue
         kps = f["dancers"][dancer_id]
+        k3  = _kps3d(f, dancer_id) if use_3d else None
         for leg, (hip_i, knee_i, ank_i, sh_i) in legs.items():
-            knee_a = _angle_at(kps, hip_i, knee_i, ank_i)
-            hip_a  = _angle_at(kps, sh_i, hip_i, knee_i)
+            if k3 is not None:
+                h3, k3i, a3, th3 = legs3d[leg]
+                knee_a = _angle3d(k3, h3, k3i, a3)
+                hip_a  = _angle3d(k3, th3, h3, k3i)
+            else:
+                knee_a = _angle_at(kps, hip_i, knee_i, ank_i)
+                hip_a  = _angle_at(kps, sh_i, hip_i, knee_i)
             if knee_a is None or hip_a is None:
                 continue
+            # vertical track of the foot: big toe (true ground contact) if
+            # refined, else ankle
+            foot_i = toe_idx[leg] if feet_ok else ank_i
+            if not _valid(kps, foot_i):
+                foot_i = ank_i
             s = series[leg]
             s["t"].append(f["time_sec"])
             s["knee"].append(knee_a)
             s["hip"].append(hip_a)
-            s["ankle_y"].append(float(kps[ank_i, 1]) if kps[ank_i, 2] >= CONF_MIN else np.nan)
+            s["ankle_y"].append(float(kps[foot_i, 1]) if _valid(kps, foot_i) else np.nan)
+            h_i = heel_idx[leg]
+            s["heel_y"].append(float(kps[h_i, 1]) if (feet_ok and _valid(kps, h_i)) else np.nan)
         c = get_center(kps)
         if c[2] >= CONF_MIN:
             b_t.append(f["time_sec"])
@@ -605,6 +756,7 @@ def _articulation_per_step(frames: list, dancer_id: int, fps: float,
         s["knee"]    = _smooth(np.array(s["knee"])) if len(s["knee"]) >= SMOOTH_WINDOW else np.array(s["knee"])
         s["hip"]     = _smooth(np.array(s["hip"]))  if len(s["hip"])  >= SMOOTH_WINDOW else np.array(s["hip"])
         s["ankle_y"] = np.array(s["ankle_y"])
+        s["heel_y"]  = np.array(s["heel_y"])
     b_t   = np.array(b_t)
     b_com = np.array(b_com)
     b_pit = np.array(b_pit)
@@ -619,7 +771,7 @@ def _articulation_per_step(frames: list, dancer_id: int, fps: float,
         m = (s["t"] >= t_ev - W) & (s["t"] <= t_ev + W)
         if m.sum() < 5:
             return None
-        return s["t"][m], s["knee"][m], s["hip"][m], s["ankle_y"][m]
+        return s["t"][m], s["knee"][m], s["hip"][m], s["ankle_y"][m], s["heel_y"][m]
 
     records: list = []
     for t_ev in art_times:
@@ -632,7 +784,7 @@ def _articulation_per_step(frames: list, dancer_id: int, fps: float,
             ay = w[3][~np.isnan(w[3])]
             return float(np.max(ay) - np.min(ay)) if len(ay) >= 3 else -1.0
         move_leg  = max(win, key=lambda lg: _ankle_exc(win[lg]))
-        tt, kn, hp, an = win[move_leg]
+        tt, kn, hp, an, he = win[move_leg]
         stand_leg = next((lg for lg in legs if lg != move_leg and lg in win), None)
 
         straight_ref = float(np.max(kn))
@@ -642,7 +794,8 @@ def _articulation_per_step(frames: list, dancer_id: int, fps: float,
             continue
 
         # FREE phase of the moving foot: its ankle raised above its own resting level.
-        an_med   = float(np.nanmedian(an)) if np.isfinite(np.nanmedian(an)) else np.nan
+        _an_ok   = an[~np.isnan(an)]
+        an_med   = float(np.median(_an_ok)) if len(_an_ok) else np.nan
         free_msk = (~np.isnan(an)) & (an < an_med - LIFT_TOL)   # smaller y = higher foot
         if free_msk.sum() >= 3:
             kn_free, hp_free = kn[free_msk], hp[free_msk]
@@ -699,6 +852,37 @@ def _articulation_per_step(frames: list, dancer_id: int, fps: float,
         if len(an_valid) >= 3:
             rec["ankle_lift"] = float(np.max(an_valid) - np.min(an_valid)) / max(bh_mean, 1.0)
 
+        # Landing roll-through: which part of the moving foot takes weight first.
+        # After the lift apex, find when the toe and the heel each return to their
+        # grounded level; the sign of the lag classifies the landing:
+        #   toe first (rolls ball→heel), heel first, flat (same frame at ~30 fps),
+        #   or ball-only (heel never grounds in the window — triples/anchors held
+        #   on the ball). Needs real toe+heel tracks, i.e. Halpe-26 feet.
+        rec["toe_heel_lag_ms"] = np.nan
+        rec["landing"] = "na"
+        if feet_ok:
+            toe_v, heel_v = ~np.isnan(an), ~np.isnan(he)
+            if toe_v.sum() >= 5 and heel_v.sum() >= 5:
+                g_toe  = float(np.percentile(an[toe_v], 85))   # grounded baseline
+                g_heel = float(np.percentile(he[heel_v], 85))  # (foot is down most of the window)
+                tol    = 0.02 * max(bh_mean, 1.0)
+                i_ap   = int(np.nanargmin(an))                 # lift apex (highest toe)
+
+                def _contact(y, valid, ground):
+                    for i in range(i_ap, len(y)):
+                        if valid[i] and y[i] >= ground - tol:
+                            return float(tt[i])
+                    return None
+
+                toe_c  = _contact(an, toe_v, g_toe)
+                heel_c = _contact(he, heel_v, g_heel)
+                if toe_c is not None and heel_c is not None:
+                    lag = (heel_c - toe_c) * 1000.0    # + = toe grounded first
+                    rec["toe_heel_lag_ms"] = float(lag)
+                    rec["landing"] = "toe" if lag > 15 else ("heel" if lag < -15 else "flat")
+                elif toe_c is not None:
+                    rec["landing"] = "ball"
+
         # body channels in the window: torso pitch range (deg) and COM vertical drop (BH)
         if len(b_t):
             bm = (b_t >= t_ev - W) & (b_t <= t_ev + W)
@@ -724,7 +908,9 @@ def _articulation_quality(frames: list, dancer_id: int, fps: float,
     biggest steps (the dynamic range), which the median hides.
     """
     recs = _articulation_per_step(frames, dancer_id, fps, step_data, bh_mean)
-    zero = {"art_step_count": 0, **{k: 0.0 for k in _ART_QUALITY_KEYS}}
+    angle_source = "3d" if _pose3d_available(frames, dancer_id) else "2d"
+    zero = {"art_step_count": 0, "art_angle_source": angle_source,
+            **{k: 0.0 for k in _ART_QUALITY_KEYS}}
     if not recs:
         return zero
 
@@ -739,8 +925,27 @@ def _articulation_quality(frames: list, dancer_id: int, fps: float,
 
     fk, wk = _col("free_knee"), _col("wt_knee")
     prep = [r["prep"] for r in recs]
+
+    # landing roll-through breakdown (measured landings only)
+    landings = [r.get("landing", "na") for r in recs]
+    n_land = sum(1 for l in landings if l != "na")
+    def _lpct(kind):
+        return round(100.0 * landings.count(kind) / n_land, 1) if n_land else 0.0
+    # mean, not median: lags quantize to frame steps (±33 ms at 30 fps) and the
+    # dominant same-frame "flat" bucket pins the median to 0; the mean keeps the
+    # toe-first vs heel-first skew visible.
+    lags = _col("toe_heel_lag_ms")
+    roll_lag = round(float(np.mean(lags)), 1) if lags else 0.0
+
     return {
         "art_step_count":             len(recs),
+        "art_angle_source":           angle_source,
+        "art_toe_first_pct":          _lpct("toe"),
+        "art_heel_first_pct":         _lpct("heel"),
+        "art_flat_pct":               _lpct("flat"),
+        "art_ball_only_pct":          _lpct("ball"),
+        "art_roll_lag_ms":            roll_lag,
+        "art_roll_n":                 n_land,
         "art_free_knee_flex_deg":     _md(fk),
         "art_free_hip_flex_deg":      _md(_col("free_hip")),
         "art_weighted_knee_flex_deg": _md(wk),
@@ -951,6 +1156,9 @@ def compute_leg_action(frames: list, dancer_id: int, fps: float) -> dict:
         "triple_step_count":        triple_count,
         "one_foot_pct":             step_data.get("one_foot_pct", 0.0),
         "two_foot_pct":             step_data.get("two_foot_pct", 0.0),
+        "one_foot_airborne_pct":    step_data.get("one_foot_airborne_pct", 0.0),
+        "ball_foot_pct":            step_data.get("ball_foot_pct", 0.0),
+        "foot_kps_used":            step_data.get("foot_kps_used", False),
         **art_quality,              # art_* articulation-quality metrics
         "step_data":                step_data,   # kept for musicality
     }
@@ -1024,6 +1232,68 @@ def compute_body_action(frames: list, dancer_id: int, fps: float) -> dict:
             sway_times.append(t)
 
     bh_mean = float(np.mean(bhs)) if bhs else 1.0
+
+    # ------------------------------------------------- 3D UPGRADE (if lifted)
+    # The 2D projections above conflate pitch with lateral lean whenever the
+    # camera isn't exactly side-on, and are blind to axial rotation (a rotating
+    # shoulder line foreshortens in the image instead of tilting — those frames
+    # are even filtered out above). With lifted 3D joints:
+    #   * clip-level "up" = the average pelvis→thorax direction (a dancer is
+    #     upright on average), so no camera-tilt assumption is needed;
+    #   * per frame, the hip line (anatomical right−left, so the frame stays
+    #     body-fixed through turns) gives the lateral axis; up × lateral gives
+    #     body-forward;
+    #   * pitch  = torso angle in the body's sagittal plane (true fwd/back),
+    #     tilt   = shoulder/hip line elevation out of the horizontal plane,
+    #     rotation = signed angle between the shoulder and hip lines projected
+    #     onto the horizontal plane — upper/lower AXIAL rotation, which 2D
+    #     fundamentally cannot see.
+    # The pitch/sway series computed above are then replaced so the shared
+    # aggregation below runs on the truer signals.
+    body_angle_source = "2d"
+    rot_angles: list[float] = []
+    if _pose3d_available(frames, dancer_id):
+        ts3, torsos, sh_lines, hip_lines = [], [], [], []
+        for f in frames:
+            k3 = _kps3d(f, dancer_id)
+            if k3 is None:
+                continue
+            ts3.append(f["time_sec"])
+            torsos.append(k3[KP3D["thorax"]] - k3[KP3D["pelvis"]])
+            sh_lines.append(k3[KP3D["right_shoulder"]] - k3[KP3D["left_shoulder"]])
+            hip_lines.append(k3[KP3D["right_hip"]] - k3[KP3D["left_hip"]])
+        if len(ts3) > SMOOTH_WINDOW + 2:
+            torsos    = np.asarray(torsos)
+            sh_lines  = np.asarray(sh_lines)
+            hip_lines = np.asarray(hip_lines)
+            up = torsos.mean(axis=0)
+            up /= max(float(np.linalg.norm(up)), 1e-9)
+
+            def _unit(a):
+                return a / np.maximum(np.linalg.norm(a, axis=1, keepdims=True), 1e-9)
+
+            hip_h = hip_lines - np.outer(hip_lines @ up, up)   # horizontal components
+            sh_h  = sh_lines  - np.outer(sh_lines  @ up, up)
+            ok = ((np.linalg.norm(hip_h, axis=1) > 1e-6)
+                  & (np.linalg.norm(sh_h, axis=1) > 1e-6)
+                  & (np.linalg.norm(torsos, axis=1) > 1e-6))
+
+            lat = _unit(hip_h)                 # body lateral axis
+            fwd = np.cross(up, lat)            # body forward axis (right-handed)
+            pitch3 = np.degrees(np.arctan2(np.einsum("ij,ij->i", torsos, fwd),
+                                           torsos @ up))
+            sh_tilt3  = np.degrees(np.arcsin(np.clip(_unit(sh_lines)  @ up, -1, 1)))
+            hip_tilt3 = np.degrees(np.arcsin(np.clip(_unit(hip_lines) @ up, -1, 1)))
+            sh_hn, hip_hn = _unit(sh_h), _unit(hip_h)
+            rot3 = np.degrees(np.arctan2(np.cross(hip_hn, sh_hn) @ up,
+                                         np.einsum("ij,ij->i", hip_hn, sh_hn)))
+
+            ts3 = np.asarray(ts3)
+            pitch_times,  pitch_angles = list(ts3[ok]), list(pitch3[ok])
+            sway_times = list(ts3[ok])
+            sh_angles, hi_angles = list(sh_tilt3[ok]), list(hip_tilt3[ok])
+            rot_angles = list(rot3[ok])
+            body_angle_source = "3d"
 
     # ------------------------------------------------------------------ PITCH
     pitch_range_deg = 0.0
@@ -1126,7 +1396,32 @@ def compute_body_action(frames: list, dancer_id: int, fps: float) -> dict:
         diss = np.abs((raw + 180) % 360 - 180)
         upper_lower_sway_dissoc = float(np.mean(diss))
 
+    # -------------------------------------------------- AXIAL ROTATION (3D only)
+    upper_lower_rotation_mean = 0.0
+    upper_lower_rotation_p90  = 0.0
+    if len(rot_angles) > SMOOTH_WINDOW + 2:
+        rot_abs = np.abs(_smooth(np.array(rot_angles)))
+        upper_lower_rotation_mean = float(np.mean(rot_abs))
+        upper_lower_rotation_p90  = float(np.percentile(rot_abs, 90))
+
+    # 3D ranges: robust percentile spread instead of min-max. The min-max
+    # (circular) range is defined by a handful of outlier frames — a single
+    # glitchy spin moment sets the number for the whole clip (2D tilt "ranges"
+    # read 200°+ because of this). The 3D angles live in [-90, 90] with no wrap,
+    # so a plain p97.5−p2.5 spread is meaningful and stable.
+    if body_angle_source == "3d":
+        def _robust_range(vals):
+            a = _smooth(np.array(vals)) if len(vals) >= SMOOTH_WINDOW else np.array(vals)
+            return float(np.percentile(a, 97.5) - np.percentile(a, 2.5)) if len(a) else 0.0
+        if pitch_angles:
+            pitch_range_deg = _robust_range(pitch_angles)
+        shoulder_tilt_range = _robust_range(sh_angles)
+        hip_tilt_range      = _robust_range(hi_angles)
+
     return {
+        "body_angle_source":              body_angle_source,
+        "upper_lower_rotation_mean_deg":  round(upper_lower_rotation_mean, 1),
+        "upper_lower_rotation_p90_deg":   round(upper_lower_rotation_p90, 1),
         "pitch_range_deg":           round(pitch_range_deg, 1),
         "pitch_rhythm_hz":           round(pitch_rhythm_hz, 3),
         "hip_shoulder_lag_ms":       hip_shoulder_lag_ms,
