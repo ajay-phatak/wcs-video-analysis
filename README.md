@@ -183,3 +183,52 @@ YOLOv8-pose, COCO-17 keypoints. There is **no foot keypoint** in COCO-17; ankle
 lift is estimated as a proxy from the moving-foot's vertical excursion. Joint angles
 are 2-D side-on estimates — good for relative you-vs-pro comparisons, not absolute
 biomechanical measurements.
+
+### The three-pass extraction pipeline
+
+Pass 1 (above) handles detection, tracking, and identity. Two further passes
+upgrade keypoint quality; run them in this order (each invalidates the next):
+
+**Pass 2 — `pose_refine.py` (top-down refinement, adds feet).** Keeps pass-1's
+tracking but re-estimates each dancer's keypoints with RTMPose in **Halpe-26**
+format. Pass 1 sees the whole frame at ~640px, so small/distant dancers get
+thumbnail-quality joints; the refinement crops each dancer from the
+original-resolution frame, cutting keypoint jitter ~15–55% and adding real
+foot keypoints — heels + toes at indices 20–25 (0–16 stay COCO-compatible so
+all metrics work unchanged). ~40 f/s on CPU; `--mode performance` for the
+larger 384×288 model; `--preview <sec>` writes a before/after overlay png.
+
+```bash
+python pose_refine.py path/to/clip.mp4 --replace-cache   # pass 1 kept as *_poses_pass1.json
+```
+
+**Pass 3 — `pose_lift.py` (3D lifting).** Lifts each dancer's 2D keypoint
+sequence to root-relative 3D joints (VideoPose3D temporal model, H36M-17
+format, stored per frame under `dancers3d` alongside the untouched 2D data).
+2D joint angles are camera-angle-dependent — your clip and a pro clip filmed
+from different positions aren't directly comparable; 3D joint angles are
+rotation-invariant. Validated: 3D leg bone lengths ~3× more stable than 2D,
+L/R symmetry ~1%. Arm joints are noisier than legs/torso — prefer leg/torso
+angles for 3D metrics. Global travel and absolute rise/fall stay 2D (the 3D
+output is root-relative, so it has no global trajectory).
+
+```bash
+python pose_lift.py path/to/clip.mp4        # augments <stem>_poses.json in place
+```
+
+**Re-running the whole library — `reextract_all.py`.** Refined metrics are NOT
+comparable against pass-1 metrics (one-foot % in particular reads dramatically
+higher — more accurately — with refined ankles). Whenever the pipeline
+changes, re-extract your clips **and** all pro references together so
+everything stays on the same measurement scale:
+
+```bash
+python reextract_all.py --dry-run    # list what would be processed
+python reextract_all.py              # refine + lift every cached clip
+```
+
+Credits: pass 2 uses [RTMPose](https://github.com/open-mmlab/mmpose) via
+[rtmlib](https://github.com/Tau-J/rtmlib) (Apache-2.0); pass 3 uses
+[VideoPose3D](https://github.com/facebookresearch/VideoPose3D)
+(CC-BY-NC-4.0, non-commercial — model definition vendored as
+`videopose3d_model.py`, pretrained weights downloaded on first run).

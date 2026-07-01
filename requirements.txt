@@ -4,7 +4,9 @@
 # Also requires ffmpeg on PATH for audio extraction:
 #   Windows: winget install Gyan.FFmpeg  OR  choco install ffmpeg
 
-ultralytics>=8.0.0        # YOLOv8-pose multi-person tracking
+ultralytics>=8.0.0        # YOLOv8-pose multi-person tracking (pass 1)
+rtmlib>=0.0.13            # RTMPose top-down refinement, Halpe-26 w/ feet (pass 2)
+onnxruntime>=1.18.0       # inference backend for rtmlib
 opencv-python>=4.8.0      # video I/O
 numpy>=1.24.0
 scipy>=1.11.0             # signal processing (Savitzky-Golay, FFT, peaks)
